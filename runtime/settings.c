@@ -409,9 +409,9 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "antialias"))  // ("fxaa": SMAA now; "taa": Vulkan only)
             g_settings.antialias = !strcmp(val, "off") ? AA_OFF : !strcmp(val, "taa") ? AA_TAA_OR_SMAA : AA_SMAA;
-        else if (!strcmp(key, "render_scale")) {  // (percent: 50, 75, 100, 125, 150, 200)
+        else if (!strcmp(key, "render_scale")) {  // (percent: 50, 75, 100, 125, 133, 150, 200)
             int p = atoi(val);
-            g_settings.render_scale = p >= 200 ? RSCALE_200 : p >= 150 ? RSCALE_150 : p >= 125 ? RSCALE_125
+            g_settings.render_scale = p >= 200 ? RSCALE_200 : p >= 150 ? RSCALE_150 : p >= 133 ? RSCALE_133 : p >= 125 ? RSCALE_125
                                     : p >= 100 ? RSCALE_100 : p >= 75 ? RSCALE_75 : RSCALE_50;
         }
         else if (!strcmp(key, "anisotropy")) {  // (game, 2x .. 16x)
@@ -770,7 +770,7 @@ void settings_save(void) {
     fprintf(f, "upscaler = %s\n", u >= 0 && u < UPSCALE_COUNT ? ups[u] : "off");
     fprintf(f, "upscaler_quality = %s\n", k_quality[uq >= 0 && uq < UPQ_COUNT ? uq : UPQ_QUALITY]);
     {
-        static const int rs[RSCALE_COUNT] = {50, 75, 100, 125, 150, 200};
+        static const int rs[RSCALE_COUNT] = {50, 75, 100, 125, 133, 150, 200};
         int r = g_settings.render_scale;
         fprintf(f, "render_scale = %d\n", rs[r >= 0 && r < RSCALE_COUNT ? r : RSCALE_100]);
     }

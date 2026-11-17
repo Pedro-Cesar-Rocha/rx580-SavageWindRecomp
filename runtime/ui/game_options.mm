@@ -873,7 +873,7 @@ void build_items(void) {
     v.push_back(choice(P_VIDEO_ADV, "Render scale", "Below 100%: faster, blurrier. Above 100%: renders bigger, then shrinks to the window. Smoothest edges.",
                        [](const Item &) { return (int)RSCALE_COUNT; },
                        [](const Item &, int x) {
-                           static const char *const r[] = {"50%", "75%", "100%", "125%", "150%", "200%"};
+                           static const char *const r[] = {"50%", "75%", "100%", "125%", "133%", "150%", "200%"};
                            return r[x];
                        },
                        [](const Item &) { return g_settings.render_scale; },

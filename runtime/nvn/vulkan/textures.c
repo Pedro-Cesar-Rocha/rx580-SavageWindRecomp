@@ -692,6 +692,12 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         if (sparse) LOG("[vk] image creation failed (%d): nvn fmt %#x %ux%ux%u target %u\n", r, t->format, t->width, t->height, t->depth, t->target);
         VK_CHECK(r);
     }
+    // (exec.c depth layout tracking) a new image starts in GENERAL (vk_image_init_layout below), untracked until a pass
+    // draws into it
+    b->dl = 0;
+    b->dl_attached = false;
+    b->dl_ok = depthfmt && type == VK_IMAGE_TYPE_2D && levels == 1 && samples == 1 &&
+               (ci.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) && vk_depth_layouts();
     b->cube_ok = (ci.flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0;
     b->not_attachable = !(ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
     static uint64_t serials;
@@ -805,6 +811,7 @@ static void destroy_image(TexBackend *b) {
             b->block_lv[i] = NULL;
         }
     b->block = NULL;
+    vk_dl_forget(b);
     views_forget(b);
     texmem_forget(b);
     if (b->image) vk_hdr_image_gone(b->image);  // (a present record may still name it)

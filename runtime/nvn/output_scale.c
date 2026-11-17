@@ -154,7 +154,7 @@ void output_scale(double dw, double dh, bool reshape_allowed, OutScale *o) {
     // (supersampling: the cleanest anti-aliasing, at the GPU's cost); below it smaller, scaled up (faster, blurrier).
     // MAX_TEX below still caps it. On Vulkan, only the 3D scene (RS_SCENE) scales with render_scale so the UI/HUD
     // stays sharp at the output resolution (#746).
-    static const double ss_f[RSCALE_COUNT] = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0};
+    static const double ss_f[RSCALE_COUNT] = {0.5, 0.75, 1.0, 1.25, 4.0 / 3.0, 1.5, 2.0};
     int rsi = g_settings.render_scale;
     double ss = rsi >= 0 && rsi < RSCALE_COUNT ? ss_f[rsi] : 1.0;
 #ifdef __APPLE__

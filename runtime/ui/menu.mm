@@ -1029,7 +1029,7 @@ static void tab_display(void) {
                "glare goes, and the grass keeps its colour and a soft sheen. Applies from the next start.");
 #endif
     {   // supersampling (nvn/output_scale.c): applies at once
-        static const char *const rscale[] = {"50%", "75%", "100%", "125%", "150%", "200%"};
+        static const char *const rscale[] = {"50%", "75%", "100%", "125%", "133%", "150%", "200%"};
         opt_choice("Render scale", &g_settings.render_scale, rscale, RSCALE_COUNT, RSCALE_100,
                    "Below 100% the game renders at a lower resolution than the window and is scaled up to it: faster, "
                    "but blurrier (50% is a quarter of the pixels, for weak graphics cards). Above 100% it renders at a "

@@ -6,6 +6,9 @@
 // Synchronisation model: every image lives in VK_IMAGE_LAYOUT_GENERAL, and a full memory barrier separates
 // render passes, copies and dispatches (Metal tracks these hazards itself). Submissions are numbered; a timeline
 // semaphore signals each number, which is what NVN fences (renderer_fence_seq / renderer_wait_seq) wait for.
+// One exception (exec.c "depth layout tracking", vk_depth_layouts: AMD's own driver by default): depth / stencil
+// targets a pass has drawn into rest in DEPTH_STENCIL_READ_ONLY_OPTIMAL and change layout lazily (attachment, transfer
+// source, GENERAL), so the driver keeps them compressed; a use of one outside exec.c takes its layout from there.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -164,6 +167,11 @@ typedef struct TexBackend {
     uint16_t block_slice;
     bool gpu_bc4;                // BC4 kept as BC4 though SAVAGEWIND_VK_BC4_CPU is on: the GPU draws into its blocks
     bool block_pending;          // (exec.c) the attachment view just made is block's: copy it after the pass
+    // (exec.c depth layout tracking, vk_depth_layouts) a depth / stencil target kept out of GENERAL, so AMD's driver
+    // keeps it compressed: dl_ok when made (2D, one level, one sample), dl_attached once a pass has drawn into it (its
+    // layout is tracked from then on), dl the layout the whole image is in now (exec.c DL_*)
+    bool dl_ok, dl_attached;
+    uint8_t dl;
 } TexBackend;
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
@@ -204,6 +212,9 @@ VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok, float bias);  // (aniso_o
 VkSampler vk_default_sampler(bool linear);
 VkSampler vk_text_sampler(void);
 void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect);
+// Depth layout tracking (exec.c): on for depth targets made from now on; a tracked image being destroyed is forgotten.
+bool vk_depth_layouts(void);
+void vk_dl_forget(TexBackend *b);
 // Destruction once every submission that may use the object has completed.
 void vk_defer_image(VkImage img, VmaAllocation mem);
 void vk_defer_view(VkImageView v);

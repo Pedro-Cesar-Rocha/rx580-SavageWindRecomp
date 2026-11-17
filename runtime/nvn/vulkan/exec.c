@@ -323,6 +323,128 @@ void vk_full_barrier(VkCommandBuffer cb) {
     bar_n = 0;
 }
 
+// ================================================================== depth layout tracking
+// Every other image lives in GENERAL (vk.h), and there AMD's own driver keeps no image compressed: a depth / stencil
+// target in GENERAL has no HTILE, so neither its depth compression nor the hierarchical depth and stencil tests that
+// drop hidden pixels before they are shaded. Measured on an RX 580 at 2560x1440 (Kakariko, the targets in their
+// attachment layout for each pass): the G-buffer pass 4.9 -> 3.9 ms, the lights' stencil-tested pass 1.8 -> 1.0 ms, the
+// sun's shadow cascades 1.1 -> 0.4 ms. So depth / stencil targets (TexBackend dl_ok: 2D, one level, one sample) are
+// kept out of GENERAL once a pass has drawn into them: DEPTH_STENCIL_ATTACHMENT_OPTIMAL in a pass that writes them,
+// DEPTH_STENCIL_READ_ONLY_OPTIMAL otherwise - passes that only test against them, and every shader that samples them,
+// also while they are the pass's (read-only) depth: their resting layout, still compressed - TRANSFER_SRC_OPTIMAL while
+// copied from (the game's depth pyramid), and GENERAL only for what writes them outside a pass (a copy into one) and
+// the runtime's own passes that sample the scene's depth (TAA, FSR 3, DLSS, frame generation). The layout is the whole
+// image's (every level and layer) and changes only when the next use needs another one; the targets of earlier passes
+// go back to their resting layout when the next pass begins (dl_release_except), so a draw never finds one it samples
+// in another layout inside a pass. SAVAGEWIND_VK_DEPTH_LAYOUTS=0: off (GENERAL, as before); =1: on with any driver
+// (default: AMD's own, the one measured).
+enum { DL_GENERAL = 0, DL_RO, DL_ATT, DL_SRC };
+static int pass_dl;             // the layout of the open pass's depth target (DL_GENERAL: none, or untracked)
+static TexBackend *pass_dl_be;  // ... and that target
+static int dl_next = -1;        // the layout the next begin_pass gives its depth target (dl_prepare_draw, clear); -1: keep
+// The next begin_pass only begins the open pass again for a depth layout (dl_restart): to everything else it is the same
+// pass. The once-a-frame feedback snapshots of the strict formats are refused past a write in a later pass (resolve_feedback,
+// pass_serial): counted as new passes, these restarts made the snapshots of BOTW's ~34 reads a frame of its R32F target
+// in one pass new copies each time (RX 580, 1440p, water in view: ~5 -> ~110 full-screen copies a frame, 73 -> 35 fps).
+static bool dl_same_pass;
+static VkImageMemoryBarrier2 dl_pend[32];
+static int dl_npend;
+static TexBackend *dl_out[64];  // tracked images out of their resting layout (DL_RO)
+static int dl_nout;
+static uint64_t stat_dl_trans, stat_dl_restarts, stat_dl_general;
+
+bool vk_depth_layouts(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SAVAGEWIND_VK_DEPTH_LAYOUTS");
+        on = e && *e ? atoi(e) != 0 : g_vk.amd_proprietary;
+        LOG("[vk] depth targets kept compressed (out of GENERAL): %s\n", on ? "on" : "off");
+    }
+    return on;
+}
+
+static VkImageLayout dl_vk(int l) {
+    return l == DL_RO ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+         : l == DL_ATT ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+         : l == DL_SRC ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+}
+static bool dl_tracked(const TexBackend *b) { return b && b->dl_ok && b->dl_attached && b->image; }
+// The layout image b is in now (GENERAL for any untracked image)
+static VkImageLayout dl_layout(const TexBackend *b) { return dl_tracked(b) ? dl_vk(b->dl) : VK_IMAGE_LAYOUT_GENERAL; }
+
+static void dl_flush(VkCommandBuffer cb) {  // (outside a pass) the transitions asked for since the last flush
+    if (!dl_npend) return;
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = (uint32_t)dl_npend,
+                           .pImageMemoryBarriers = dl_pend};
+    rec_CmdPipelineBarrier2(cb, &di);
+    dl_npend = 0;
+}
+
+// Tracked image b into layout l, recorded with the next dl_flush (the caller is outside a pass and flushes before the
+// use). The barrier also orders the image's earlier uses before its next ones.
+static void dl_to(TexBackend *b, int l) {
+    if (!dl_tracked(b) || b->dl == l) return;
+    if (dl_npend == 32) dl_flush(vk_cmd());
+    bool ds = b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    dl_pend[dl_npend++] = (VkImageMemoryBarrier2){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, .oldLayout = dl_vk(b->dl),
+        .newLayout = dl_vk(l), .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = b->image, .subresourceRange = {ds ? b->aspect : VK_IMAGE_ASPECT_DEPTH_BIT, 0, VK_REMAINING_MIP_LEVELS, 0,
+                                                VK_REMAINING_ARRAY_LAYERS}};
+    b->dl = (uint8_t)l;
+    stat_dl_trans++;
+    int k = 0;
+    while (k < dl_nout && dl_out[k] != b) k++;
+    if (l == DL_RO) {
+        if (k < dl_nout) dl_out[k] = dl_out[--dl_nout];
+    } else if (k == dl_nout) {
+        if (dl_nout == 64) {  // (never in practice: the oldest goes back first)
+            TexBackend *o = dl_out[0];
+            dl_out[0] = dl_out[--dl_nout];
+            dl_to(o, DL_RO);
+        }
+        dl_out[dl_nout++] = b;
+    }
+}
+
+// Every tracked image out of its resting layout but keep back in it (a pass about to begin)
+static void dl_release_except(TexBackend *keep) {
+    for (int i = dl_nout - 1; i >= 0; i--)
+        if (i < dl_nout && dl_out[i] != keep) dl_to(dl_out[i], DL_RO);
+}
+
+static TexBackend *bar_be[64];  // (pass_barrier_note) the images of bar_img, for their layouts
+void vk_dl_forget(TexBackend *b) {  // (textures.c destroy_image) its image goes: nothing may name it any more
+    for (int i = 0; i < dl_nout; i++) if (dl_out[i] == b) { dl_out[i] = dl_out[--dl_nout]; break; }
+    for (int i = 0; i < dl_npend; i++)  // (a transition not recorded yet: dropped, the image is never used again)
+        if (b->image && dl_pend[i].image == b->image) { dl_pend[i--] = dl_pend[--dl_npend]; }
+    for (int i = 0; i < 64; i++) if (bar_be[i] == b) bar_be[i] = NULL;
+    if (pass_dl_be == b) pass_dl_be = NULL;
+    b->dl = DL_GENERAL;
+    b->dl_attached = false;
+}
+
+// The layout a transfer command names for image b (outside a pass): src, or the destination (dst) of a copy, blit,
+// clear or resolve. A tracked image is moved to it first (a copy into one decompresses it: GENERAL).
+static VkImageLayout dl_for_transfer(VkCommandBuffer cb, TexBackend *b, bool dst) {
+    if (!dl_tracked(b)) return VK_IMAGE_LAYOUT_GENERAL;
+    if (dst) stat_dl_general++;
+    dl_to(b, dst ? DL_GENERAL : DL_SRC);
+    dl_flush(cb);
+    return dl_vk(b->dl);
+}
+// The same, for a copy within one image (both sides GENERAL, as Vulkan requires)
+static VkImageLayout dl_for_self_copy(VkCommandBuffer cb, TexBackend *b) { return dl_for_transfer(cb, b, true); }
+// (outside a pass) b for one of the runtime's own passes, which sample it in GENERAL
+static void dl_general(VkCommandBuffer cb, TexBackend *b) {
+    if (!dl_tracked(b) || b->dl == DL_GENERAL) return;
+    stat_dl_general++;
+    dl_to(b, DL_GENERAL);
+    dl_flush(cb);
+}
+
 static void pass_barrier(VkCommandBuffer cb) {
     static int full = -1;
     if (full < 0) full = getenv("SAVAGEWIND_VK_FULL_PASS_BARRIER") != NULL;
@@ -334,12 +456,14 @@ static void pass_barrier(VkCommandBuffer cb) {
     VkImageMemoryBarrier2 ib[64];
     for (int i = 0; i < bar_n; i++) {
         bool ds = bar_aspect[i] & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+        // (a tracked depth target: the layout it is in, kept)
+        VkImageLayout l = bar_be[i] && bar_be[i]->image == bar_img[i] ? dl_layout(bar_be[i]) : VK_IMAGE_LAYOUT_GENERAL;
         ib[i] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
                                         .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                         .srcAccessMask = ds ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                                         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                         .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-                                        .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                        .oldLayout = l, .newLayout = l,
                                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                                         .image = bar_img[i],
                                         .subresourceRange = {bar_aspect[i], 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
@@ -357,6 +481,7 @@ static void pass_barrier_note(TexBackend *b) {  // a target of the pass begun
     for (int i = 0; i < bar_n; i++) if (bar_img[i] == b->image) return;
     if (bar_n == 64) { bar_other = true; return; }
     bar_img[bar_n] = b->image;
+    bar_be[bar_n] = b;
     bar_aspect[bar_n++] = b->aspect ? b->aspect : VK_IMAGE_ASPECT_COLOR_BIT;
 }
 
@@ -1338,6 +1463,12 @@ const char *renderer_stats(void) {
         n = strlen(stats_text);
         if (stat_clear_folds) snprintf(stats_text + n, sizeof stats_text - n, ", clears folded %llu", (unsigned long long)stat_clear_folds);
         stat_clear_folds = 0;
+        n = strlen(stats_text);
+        if (stat_dl_trans)  // (depth layout tracking: moves between layouts, passes begun again for one, moves to GENERAL)
+            snprintf(stats_text + n, sizeof stats_text - n, ", depth layouts %llu (restarts %llu, general %llu, out %d)",
+                     (unsigned long long)stat_dl_trans, (unsigned long long)stat_dl_restarts, (unsigned long long)stat_dl_general,
+                     dl_nout);
+        stat_dl_trans = stat_dl_restarts = stat_dl_general = 0;
         stat_uub = stat_uub_same = stat_gcopy_hit = stat_gcopy_miss = stat_gcopy_bytes = stat_ubo_direct = stat_chain_barriers = 0;
         ubo_check_done(true);
         stat_gw_waits = stat_gw_holds = 0;
@@ -1710,9 +1841,120 @@ static void oq_apply(void) {  // (readback_lock held) reports whose submission c
     oq_nreports = k;
 }
 
+// ---- GPU-timed dynamic resolution (Video > Advanced > Dynamic resolution). The game times its frame with timestamp
+// counters (ReportCounter types 0 and 16, ~25 a frame; nanoseconds here, nvnDeviceGetTimestampInNanoseconds) and from the
+// time between them steps its 3D scene one size a frame (docked: 1600x900 down to 1280x720 in steps of 80 columns; each
+// size a scene target of its own, which the runtime scales). Translated on the CPU, the counters measured our command
+// translation, never the GPU: on a PC limited by its GPU the game kept its biggest size however slow the frames were.
+// The GPU time is measured with a Vulkan timestamp at each counter's place in the command stream (ts_apply, once the
+// submission is done), but it arrives 2-4 frames late (the GPU overlap), and the game, fed those times, swung between
+// its biggest and smallest size every few frames. So the counters get the decision instead, at once: a model of the
+// frame's GPU time at the biggest size (ts_full: each measured frame divided by its share of that size's pixels,
+// smoothed) times the share drawn now gives this size's time; over the target (SAVAGEWIND_DRS_TARGET_MS, default 15.8:
+// 60 fps with room) the frame reports "slow" (a size down), when even the next size up would fit it reports "fast" (a
+// size up), else a time inside the game's own hold band (measured: it keeps its size from ~26.5 to ~28.5 ms of its
+// 33 ms budget; SAVAGEWIND_DRS_HOLD_MS), so the scene settles on the biggest size that holds the target. The counters
+// keep the shape of the last measured frame, scaled to the reported time.
+// Experimental, SAVAGEWIND_DRS_GPU=1 (otherwise CPU times, as before): the model alone (its time at the size drawn now,
+// x SAVAGEWIND_DRS_SCALE, default 2) held an RX 580 at 1440p to 63 fps in Kakariko, but the size still swings: each
+// change makes images again (snapshots, post targets) and the next frames cost more. SAVAGEWIND_DRS_HOLD_MS selects the
+// hold-band controller above, whose band is not yet right.
+#define TSQ_SLOTS 512
+#define TS_PER_FRAME 64
+static VkQueryPool ts_pool;
+static uint32_t ts_next;
+typedef struct { uint64_t addr, seq; uint32_t q, idx; double px; } TsReport;  // (px: its frame's scene pixels)
+static TsReport ts_reports[64];
+static int ts_nreports;
+static double ts_last_off[TS_PER_FRAME];  // (ns) each counter's offset from its frame's first, in the last measured frame
+static bool ts_have_off[TS_PER_FRAME];
+static double ts_last_span;               // (ns) that frame's first counter to its last
+static double ts_full;                    // (ns) the model: a frame's GPU time at the biggest scene size; 0: none yet
+double g_scene_px, g_scene_px_max;        // (scene_post) the scene's pixels now, and the most it has had
+
+static bool ts_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SAVAGEWIND_VK_COUNTER"), *g = getenv("SAVAGEWIND_DRS_GPU");
+        on = g && atoi(g) && !(e && !strcmp(e, "live")) && g_vk.props.limits.timestampComputeAndGraphics;
+        if (on) {
+            VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                        .queryCount = TSQ_SLOTS};
+            if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &ts_pool) != VK_SUCCESS) on = 0;
+        }
+        LOG("[drs] dynamic resolution timed by the GPU: %s\n", on ? "on" : "off (CPU times)");
+    }
+    return on;
+}
+
+static double drs_env_ms(const char *name, double def) {
+    const char *e = getenv(name);
+    return (e && atof(e) > 0 ? atof(e) : def) * 1e6;
+}
+
+// (render thread) The time a frame's counters report now (ns, the frame's first counter to its last), and why
+static double drs_report(int *why) {
+    static double target = -1, hold, slow, fast;
+    if (target < 0) {
+        target = drs_env_ms("SAVAGEWIND_DRS_TARGET_MS", 15.8);
+        hold = drs_env_ms("SAVAGEWIND_DRS_HOLD_MS", 27.5);
+        slow = hold * 1.5, fast = hold * 0.5;
+    }
+    double share = g_scene_px_max > 0 ? g_scene_px / g_scene_px_max : 1;
+    double now = ts_full * share;
+    if (!getenv("SAVAGEWIND_DRS_HOLD_MS")) {  // (default) the model's time at this size, scaled to the game's 30 fps budget
+        static double k = -1;
+        if (k < 0) k = getenv("SAVAGEWIND_DRS_SCALE") && atof(getenv("SAVAGEWIND_DRS_SCALE")) > 0 ? atof(getenv("SAVAGEWIND_DRS_SCALE")) : 2.0;
+        *why = 0;
+        return now * k;
+    }
+    *why = now > target ? -1 : (share < 0.999 && now * 1.12 <= target) ? 1 : 0;  // (a size up: ~12% more pixels)
+    return *why < 0 ? slow : *why > 0 ? fast : hold;
+}
+
+static void ts_apply(void) {  // (readback_lock held) counters whose submission completed: the model's measurements
+    if (!ts_nreports) return;
+    uint64_t done = vk_completed_seq();
+    double period = g_vk.props.limits.timestampPeriod;
+    int n = 0;
+    for (int i = 0; i < ts_nreports; i++) {
+        TsReport *p = &ts_reports[i];
+        if (p->seq > done) { ts_reports[n++] = *p; continue; }
+        uint64_t v = 0;
+        if (vkGetQueryPoolResults(g_vk.dev, ts_pool, p->q, 1, sizeof v, &v, sizeof v, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) continue;
+        static uint64_t gpu_first;  // (the GPU time of the frame's first counter: they complete in order)
+        static double span, span_px;
+        if (p->idx == 0) {
+            if (span > 0 && span_px > 0 && g_scene_px_max > 0) {  // (the frame before is complete: into the model)
+                double full = span * g_scene_px_max / span_px;
+                ts_full = ts_full > 0 ? ts_full * 0.9 + full * 0.1 : full;
+                ts_last_span = span;
+            }
+            gpu_first = v, span = 0, span_px = p->px;
+        }
+        double off = v >= gpu_first ? (double)(v - gpu_first) * period : 0;
+        if (off > 250e6) off = 250e6;
+        if (off > span) span = off;
+        if (p->idx < TS_PER_FRAME) ts_last_off[p->idx] = off, ts_have_off[p->idx] = true;
+    }
+    ts_nreports = n;
+    static uint64_t t0;  // (log, every 4 s)
+    uint64_t now = SDL_GetTicksNS();
+    if (!t0) t0 = now;
+    if (now - t0 > 4000000000ull && ts_full > 0) {
+        int why;
+        drs_report(&why);
+        LOG("[drs] GPU frame at the biggest size %.2f ms, last %.2f ms; scene at %.0f%% of its pixels (%s)\n", ts_full / 1e6,
+            ts_last_span / 1e6, g_scene_px_max > 0 ? 100.0 * g_scene_px / g_scene_px_max : 0,
+            why < 0 ? "a size down" : why > 0 ? "a size up" : "holding");
+        t0 = now;
+    }
+}
+
 static void readbacks_apply(void) {
     pthread_mutex_lock(&readback_lock);
     oq_apply();
+    ts_apply();
     if (nreadbacks) {
         uint64_t done = vk_completed_seq();
         int k = 0;
@@ -2104,6 +2346,8 @@ static void vk_end_pass_at(int line) {
     if (!pass_void) rec_CmdEndRendering(vk_cmd());
     in_pass = false;
     pass_void = false;
+    pass_dl = DL_GENERAL;
+    pass_dl_be = NULL;
     if (det_on()) det_note(pass_key, det_written);
     for (int i = 0; i < pass_nfbl; i++) feedback_layout_move(vk_cmd(), pass_fbl[i], false);
     pass_nfbl = 0;
@@ -2142,17 +2386,27 @@ static void vk_end_pass_at(int line) {
 
 static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v : 1; }
 
+static void dl_restart(void) {  // (depth layout tracking) the open pass, in a layout the next draw can't use: begun again
+    if (in_pass && !st.rt_dirty) dl_same_pass = true;
+    st.rt_dirty = true;
+    stat_dl_restarts++;
+}
+
 static VkRect2D scissor_rect(void);
 static void begin_pass(void) {
     after_dispatch = false;  // (dispatch_compute: a pass in between)
+    int dl_req = dl_next;  // (depth layout tracking: what the draw or clear about to run needs)
+    dl_next = -1;
     if (in_pass && !st.rt_dirty) return;
+    bool same_pass = dl_same_pass;  // (begun again only for a depth layout: the same pass to the snapshots, dl_same_pass)
+    dl_same_pass = false;
     uint64_t new_key = det_on() ? det_key() : 0;  // (the hash of st.rt: only where targets are left out, Mali)
     uint8_t new_detached = det_predict(new_key);
     det_no_next = false;
     vk_end_pass();  // (notes what the pass that ends wrote under its own key)
     pass_key = new_key;
     pass_detached = new_detached;
-    pass_serial++;
+    if (!same_pass) pass_serial++;
     if (det_on()) {
         static uint64_t passes, slots, t0;
         passes++;
@@ -2462,6 +2716,22 @@ static void begin_pass(void) {
             pass_mvec = (int)pass_ncolor++;
         }
     }
+    {   // (depth layout tracking, dl_*) the depth target in the layout this pass needs, the tracked depth targets of
+        // earlier passes this one doesn't draw into back in their resting layout
+        TexBackend *db = (has_d || has_s) && st.rt.depth ? st.rt.depth->backend : NULL;
+        if (db && !db->dl_ok) db = NULL;
+        int want = DL_GENERAL;
+        if (db) {  // (a clear folded into the pass writes it; else what the draw asked for, or the layout it is in)
+            db->dl_attached = true;
+            want = fold_d || fold_s ? DL_ATT : dl_req >= 0 ? dl_req : db->dl == DL_RO ? DL_RO : DL_ATT;
+        }
+        dl_release_except(db);
+        if (db) dl_to(db, want);
+        dl_flush(cb);
+        pass_dl = db ? want : DL_GENERAL;
+        pass_dl_be = db;
+        if (db) da.imageLayout = sa.imageLayout = dl_vk(want);
+    }
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = 1,
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
@@ -2725,6 +2995,11 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
         }
         if (!in_pass || st.rt_dirty) det_no_next = true;
     }
+    if ((depth || stencil) && st.rt.depth && st.rt.depth->backend && ((TexBackend *)st.rt.depth->backend)->dl_ok) {
+        // (depth layout tracking) a depth / stencil clear writes the target: a pass that only reads it begins again
+        if (in_pass && !st.rt_dirty && pass_dl_be == st.rt.depth->backend && pass_dl == DL_RO) dl_restart();
+        dl_next = DL_ATT;
+    }
     clear_fold.c = clear_fold.d = clear_fold.s = false;
     // (only a clear that begins a pass can fold: after a draw, the clear must keep its place among the commands)
     clear_fold.want = clear_fold_on() && (!in_pass || st.rt_dirty) && (index < 0 || (mask & 0xF) == 0xF) &&
@@ -2734,6 +3009,11 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
         if (index >= 0) memcpy(clear_fold.val, color, 16);
     }
     begin_pass();
+    if (pass_dl == DL_RO && (depth || stencil) && !pass_void) {  // (depth layout tracking: the clear writes it)
+        dl_restart();
+        dl_next = DL_ATT;
+        begin_pass();
+    }
     clear_fold.want = false;
     if (index >= 0 && index < 8) det_written |= (uint8_t)(1u << index);
     if (pass_void) return;
@@ -4072,17 +4352,22 @@ static void build_pipeline(void *arg) {
 static NvnTexture *feedback_tex[4];
 static VkImageView feedback_view[4];
 static bool feedback_any_type[4];  // the view fits every lookup type (a restricted view of the image itself)
+static TexBackend *feedback_be[4];  // the bound depth target itself, read live (texture_info_ takes its layout); NULL: a copy
 static int nfeedback;
 static uint64_t g_cur_fs_hash;
-static NvnTexture *snap_tex[8];
-static TexBackend *snap_be[8];  // (the image snap_tex had when the snapshot was taken: compared, never followed)
-static bool snap_ok[8];
-static const char *snap_why[8];
+// Snapshot slots: one per target snapshotted in a frame (more targets than slots evict each other round robin, and an
+// evicted target's next read is a copy again). 8 slots were too few for some views; SNAP_IMAGES copies are kept.
+#define SNAP_SLOTS 16
+#define SNAP_IMAGES 24
+static NvnTexture *snap_tex[SNAP_SLOTS];
+static TexBackend *snap_be[SNAP_SLOTS];  // (the image snap_tex had when the snapshot was taken: compared, never followed)
+static bool snap_ok[SNAP_SLOTS];
+static const char *snap_why[SNAP_SLOTS];
 static const char *snap_reason = "?";
 // A snapshot of texture object t, or of its image through another object (BOTW reaches some targets through more than
 // one), is stale once t is written. SAVAGEWIND_VK_SNAP_BY_OBJECT=1: by object only, as before.
-static uint64_t snap_wpass[8];  // (the pass the latest write into the slot's target was in, since its snapshot; 0: none)
-static uint8_t snap_mask;
+static uint64_t snap_wpass[SNAP_SLOTS];  // (the pass the latest write into the slot's target was in, since its snapshot; 0: none)
+static uint16_t snap_mask;
 static uint64_t snap_pass_now(void);
 static void snapshots_invalidate(NvnTexture *t) {
     if (!snap_mask) return;
@@ -4096,18 +4381,20 @@ static void snapshots_invalidate(NvnTexture *t) {
         if (snap_ok[i]) { snap_ok[i] = false; snap_why[i] = snap_reason; }
     }
 }
-static uint64_t snap_pass_now(void) { return in_pass && !st.rt_dirty ? pass_serial : pass_serial + 1; }  // (the pass a write now is in)
-static bool snap_cleared[8];  // (the slot's target itself was cleared since its snapshot: its contents are another thing's)
+// (the pass a write now is in: the open one, or the one begun next - which is the same pass again after a snapshot
+// copy or a depth layout's restart, dl_same_pass)
+static uint64_t snap_pass_now(void) { return in_pass && !st.rt_dirty ? pass_serial : pass_serial + (dl_same_pass ? 0 : 1); }
+static bool snap_cleared[SNAP_SLOTS];  // (the slot's target itself was cleared since its snapshot: its contents are another thing's)
 static void snapshots_invalidate_clear(NvnTexture *t) {  // (clear(), defined before this)
     TexBackend *be = t ? (TexBackend *)t->backend : NULL;
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < SNAP_SLOTS; i++)
         if (t && (snap_tex[i] == t || (be && snap_be[i] == be))) snap_cleared[i] = true;
     snap_reason = "clear";
     snapshots_invalidate(t);
 }
 
 typedef struct { NvnTexture *key; TexBackend copy; } Snap;
-static Snap snaps[16];
+static Snap snaps[SNAP_IMAGES];
 static int nsnaps;
 
 static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
@@ -4181,7 +4468,7 @@ static TexBackend *snapshot_image(NvnTexture *t, TexBackend *src) {
     Snap *s = NULL;
     for (int i = 0; i < nsnaps; i++) if (snaps[i].key == t) s = &snaps[i];
     if (!s) {
-        if (nsnaps == 16) { static int rr; s = &snaps[rr++ & 15]; } else s = &snaps[nsnaps++];
+        if (nsnaps == SNAP_IMAGES) { static int rr; s = &snaps[rr++ % SNAP_IMAGES]; } else s = &snaps[nsnaps++];
         s->key = t;
     }
     TexBackend *d = &s->copy;
@@ -4214,7 +4501,7 @@ static void debug_save_depth(TexBackend *b, const char *path) {
     vk_full_barrier(cb);
     VkBufferImageCopy c = {.bufferOffset = out.off, .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1},
                            .imageExtent = {b->width, b->height, 1}};
-    rec_CmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    rec_CmdCopyImageToBuffer(cb, b->image, dl_for_transfer(cb, b, false), out.buf, 1, &c);
     renderer_flush();
     vk_readback_sync();
     const float *d = out.ptr;
@@ -4313,8 +4600,78 @@ static bool depth_read_only(void) {
 
 static long logfb = -1, fbskip;  // (SAVAGEWIND_LOG_FEEDBACK)
 static unsigned fb_draws;
+// (depth layout tracking) The tracked depth targets stage `stage` of the next draw or dispatch samples (and the cascades
+// a shadow lookup reads instead, shadow_copy_source), each in its resting layout before the draw: one that isn't ends
+// the open pass, which begins again after the move. db: the depth target of the draw's pass; a lookup of it (a live
+// read, resolve_feedback) sets *live instead.
+static void dl_prepare_stage(int stage, ShaderInfo *si, TexBackend *db, bool *live) {
+    if (!si || !vk_depth_layouts()) return;
+    for (int i = 0; i < si->ntex; i++) {
+        NvnTexture *t = shader_texture_object(stage, &si->tex[i]);
+        if (!t) continue;
+        NvnTexture *c = si->tex[i].shadow ? shadow_copy_source(t) : NULL;
+        for (int k = 0; k < 2; k++) {
+            NvnTexture *u = k ? c : t;
+            TexBackend *b = u ? u->backend : NULL;
+            if (!dl_tracked(b)) continue;
+            bool copy = false;  // (read through a snapshot copy of it: resolve_feedback)
+            for (int f = 0; f < nfeedback; f++) copy |= feedback_tex[f] == u && !feedback_be[f];
+            if (copy) continue;
+            if (b == db) { if (live) *live = true; continue; }
+            if (b->dl == DL_RO) continue;
+            if (in_pass) { dl_restart(); vk_end_pass(); }
+            dl_to(b, DL_RO);
+        }
+    }
+}
+
+// (depth layout tracking) Before a draw's begin_pass: what it samples in the layouts it needs (dl_prepare_stage), and the
+// layout its pass's depth target needs - ATTACHMENT where the draw writes depth or stencil, READ_ONLY where it reads
+// the target it tests against, GENERAL where it does both (as before: no copy was taken, the shader reads it through
+// another texture object). A pass already open with another one ends and begins again with it.
+static void dl_prepare_draw(Prog *pr) {
+    if (!vk_depth_layouts()) return;
+    // (the depth texture object may get its image only in begin_pass, vk_view: dl_check_draw checks again after it)
+    TexBackend *db = st.rt.depth ? st.rt.depth->backend : NULL;
+    if (db && !db->dl_ok) db = NULL;
+    bool live = false;
+    dl_prepare_stage(0, pr->vi, db, &live);
+    dl_prepare_stage(1, pr->fi, db, &live);
+    if (dl_npend && !in_pass) dl_flush(vk_cmd());
+    bool writes = !depth_read_only();
+    int want = writes ? (live ? DL_GENERAL : DL_ATT) : live ? DL_RO : -1;
+    dl_next = want;
+    if (!db) return;
+    if (want >= 0 && in_pass && !st.rt_dirty && pass_dl_be == db && pass_dl != want && pass_dl != DL_GENERAL) dl_restart();
+}
+
+// (depth layout tracking) After the draw's begin_pass, with the pass's depth target known for sure: the layout it is in
+// fits what the draw does to it (writes, a live read, both), or the pass begins again in the one that does. false: the
+// pass came out void (the draw is skipped).
+static bool dl_check_draw(Prog *pr) {
+    TexBackend *pb = pass_dl_be;
+    if (!pb || pass_dl == DL_GENERAL) return true;
+    bool live = false;
+    dl_prepare_stage(0, pr->vi, pb, &live);  // (no moves here: begin_pass released the other targets)
+    dl_prepare_stage(1, pr->fi, pb, &live);
+    if (dl_npend && !in_pass) dl_flush(vk_cmd());
+    bool writes = !depth_read_only();
+    int need = writes ? (live ? DL_GENERAL : DL_ATT) : live ? DL_RO : -1;
+    if (in_pass && (need < 0 || need == pass_dl)) return true;
+    static int nlog;
+    if (nlog++ < 8)
+        LOG("[vk] depth layouts: pass begun again for a draw that %s its depth target (layout %d, fs %016llx)\n",
+            writes && live ? "writes and reads" : writes ? "writes" : "reads", pass_dl, (unsigned long long)g_cur_fs_hash);
+    if (in_pass) dl_restart();
+    else stat_dl_restarts++;
+    dl_next = need;
+    begin_pass();
+    return !pass_void;
+}
+
 static void resolve_feedback(Prog *pr) {
     nfeedback = 0;
+    memset(feedback_be, 0, sizeof feedback_be);
     draw_feedback = false;
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_NO_FEEDBACK") != NULL;
@@ -4334,7 +4691,7 @@ static void resolve_feedback(Prog *pr) {
             static int nosnap = -1;
             if (nosnap < 0) nosnap = getenv("SAVAGEWIND_NO_SNAPSHOT_REUSE") != NULL;
             int si = -1;
-            for (int k = 0; k < 8; k++) if (snap_tex[k] == t) si = k;
+            for (int k = 0; k < SNAP_SLOTS; k++) if (snap_tex[k] == t) si = k;
             bool is_depth = same_image(t, st.rt.depth);  // (this object, or another of the bound depth image)
             bool self_write = is_depth && st.ds[0] && st.ds[1];
             TexBackend *src = vk_tex(t, true);
@@ -4365,6 +4722,7 @@ static void resolve_feedback(Prog *pr) {
                 stat_feedback_live++;
                 feedback_tex[nfeedback] = t;
                 feedback_any_type[nfeedback] = false;
+                feedback_be[nfeedback] = src;
                 feedback_view[nfeedback++] = vk_image_view(src, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
                 continue;
             }
@@ -4496,7 +4854,7 @@ static void resolve_feedback(Prog *pr) {
             // 1280x720: castle 65 -> 133 fps, Great Plateau 66 -> 141; the picture the same as with the loops).
             // SAVAGEWIND_VK_FEEDBACK_ONCE=0: a copy each time; =1: on wherever copies are made.
             static int once = -1;
-            static uint64_t snap_frame[8], snap_pass[8];
+            static uint64_t snap_frame[SNAP_SLOTS], snap_pass[SNAP_SLOTS];
             if (once < 0) {
                 const char *e = getenv("SAVAGEWIND_VK_FEEDBACK_ONCE");
                 once = e ? atoi(e) != 0 : !g_vk.feedback_loop;
@@ -4607,7 +4965,7 @@ static void resolve_feedback(Prog *pr) {
                 reuse = e ? (!strcmp(e, "pass") ? 2 : !strcmp(e, "frame") ? 1 : 0) : g_vk.is_mali ? 2 : 0;
                 LOG("[vk] feedback snapshots reused: %s\n", reuse == 2 ? "within one pass" : reuse == 1 ? "within one frame" : "until written");
             }
-            uint64_t this_pass = in_pass && !st.rt_dirty ? pass_serial : pass_serial + 1;
+            uint64_t this_pass = snap_pass_now();
             if (!nosnap && si >= 0 && (snap_ok[si] || self_write) && existing &&
                 (reuse == 0 || (reuse == 1 && snap_frame[si] == renderer_present_count() + 1) ||
                  (reuse == 2 && snap_pass[si] == this_pass))) {
@@ -4616,6 +4974,37 @@ static void resolve_feedback(Prog *pr) {
                 continue;
             }
             stat_feedback_copies++;
+            {   // A frame with many copies (each a full-screen copy and a pass break): why, logged at most every 3 s
+                enum { WHY_SLOT, WHY_IMAGE, WHY_FRAME, WHY_CLEARED, WHY_LATER, WHY_READER, WHY_OTHER, WHY_N };
+                static const char *const why_name[WHY_N] = {"no slot", "no image", "first this frame", "cleared",
+                                                            "written in a later pass", "new reader", "other"};
+                static uint64_t fr, n, why[WHY_N], last_ns;
+                static uint32_t fmts[8];
+                static int nfmt;
+                uint64_t now_fr = renderer_present_count();
+                if (now_fr != fr) {
+                    uint64_t ns = SDL_GetTicksNS();
+                    if (n > 30 && ns - last_ns > 3000000000ull) {
+                        char b[320];
+                        int o = snprintf(b, sizeof b, "[vk] snapshots: %llu copies in frame %llu:", (unsigned long long)n,
+                                         (unsigned long long)fr);
+                        for (int k = 0; k < WHY_N && o < (int)sizeof b - 40; k++)
+                            if (why[k]) o += snprintf(b + o, sizeof b - o, " %s %llu,", why_name[k], (unsigned long long)why[k]);
+                        for (int k = 0; k < nfmt && o < (int)sizeof b - 12; k++) o += snprintf(b + o, sizeof b - o, " fmt %#x", fmts[k]);
+                        LOG("%s (slots %d, images %d)\n", b, SNAP_SLOTS, nsnaps);
+                        last_ns = ns;
+                    }
+                    fr = now_fr, n = 0, nfmt = 0;
+                    memset(why, 0, sizeof why);
+                }
+                n++;
+                int w = si < 0 ? WHY_SLOT : !existing ? WHY_IMAGE : snap_frame[si] != now_fr + 1 ? WHY_FRAME
+                      : cleared ? WHY_CLEARED : later ? WHY_LATER : new_reader ? WHY_READER : WHY_OTHER;
+                why[w]++;
+                int k = 0;
+                while (k < nfmt && fmts[k] != t->format) k++;
+                if (k == nfmt && nfmt < 8) fmts[nfmt++] = t->format;
+            }
             if (!is_depth) fbdump_note(t);
             // SAVAGEWIND_LOG_FEEDBACK=<n>: 200 snapshots after the first n (what is sampled while bound)
             if (logfb < 0) logfb = getenv("SAVAGEWIND_LOG_FEEDBACK") ? (fbskip = atol(getenv("SAVAGEWIND_LOG_FEEDBACK")), 200) : 0;
@@ -4634,6 +5023,11 @@ static void resolve_feedback(Prog *pr) {
                     ci >= 0 ? (int)((st.color_state[0] >> ci) & 1) : -1, fb_draws);
                 fb_draws = 0;
             }
+            // The copy ends the open pass, but to the snapshots that begun again is the same pass (dl_same_pass): counted
+            // as a new one, a copy made every other snapshot of the strict formats stale ("written in a later pass"),
+            // and draws that read two such targets in turn while writing both copied at every read - ~56 full-screen
+            // copies a frame for as long as the view lasted (RX 580, 1440p: 60 -> 32 fps, then back).
+            bool same_pass = in_pass && !st.rt_dirty;
             vk_end_pass();
             TexBackend *dst = snapshot_image(t, src);
             VkCommandBuffer cb = vk_cmd();
@@ -4641,7 +5035,8 @@ static void resolve_feedback(Prog *pr) {
             gp_mark(cb, "feedback snapshot %ux%u fmt %d", src->width, src->height, src->format);
             VkImageCopy rg = {.srcSubresource = {src->aspect, 0, 0, 1}, .dstSubresource = {src->aspect, 0, 0, 1},
                               .extent = {src->width, src->height, 1}};
-            rec_CmdCopyImage(cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+            VkImageLayout sl = dl_for_transfer(cb, src, false);  // (a tracked depth target: copied from as it is)
+            rec_CmdCopyImage(cb, src->image, sl, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
             if (g_debug_frame && (src->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) {
                 static int nd;
                 char path[128];
@@ -4654,14 +5049,15 @@ static void resolve_feedback(Prog *pr) {
             feedback_tex[nfeedback] = t;
             feedback_any_type[nfeedback] = false;
             feedback_view[nfeedback++] = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
-            if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
-            snap_mask |= (uint8_t)(1u << si);
+            if (si < 0) { static int rr; si = rr++ % SNAP_SLOTS; snap_tex[si] = t; }
+            snap_mask |= (uint16_t)(1u << si);
             snap_ok[si] = true;
             snap_cleared[si] = false;
             snap_wpass[si] = 0;
             snap_be[si] = src;
             snap_frame[si] = renderer_present_count() + 1;  // (+1: 0 is never a frame's)
-            snap_pass[si] = pass_serial + 1;  // (the pass that begins next, after this one ends)
+            snap_pass[si] = same_pass ? pass_serial : pass_serial + 1;  // (the pass the draw is in: this one again, or the next)
+            if (same_pass) dl_same_pass = true;
             st.rt_dirty = true;
         }
     if (!nfeedback && !draw_feedback)
@@ -6966,32 +7362,43 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
             material = et->backend && !((TexBackend *)et->backend)->gpu_owned;
             text_sheet = et->backend && ((TexBackend *)et->backend)->text_scale;
             menu_tex = text_sheet && ((TexBackend *)et->backend)->menu_tex;
+            TexBackend *lb = (TexBackend *)et->backend;  // (the image the view is of: a tracked depth target's layout)
             if (et == scene_up.t && stage == 1) {  // (with the texture's own swizzle: BOTW draws its weapon wheel's
                 // blurred capture of the scene, whose alpha is 0, with alpha forced to 1)
                 view = vk_image_view(scene_up.img, VK_IMAGE_VIEW_TYPE_2D, scene_up.img->format, 0, 1, 0, 1,
                                      vk_sample_swizzle(et, e->has_view ? &e->view : NULL), VK_IMAGE_ASPECT_COLOR_BIT);
                 sc[0] = scene_up.sx; sc[1] = scene_up.sy;
+                lb = NULL;
             }
             wh[0] = et->width; wh[1] = et->height;
             // (a target of this pass that loops, g_vk.feedback_layout: its own image, not one of the copies below)
             if (et->backend && ((TexBackend *)et->backend)->in_feedback_layout && et != scene_up.t)
                 layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
             for (int k = 0; k < nfeedback; k++)
-                if (et == feedback_tex[k] && feedback_any_type[k]) view = feedback_view[k], layout = VK_IMAGE_LAYOUT_GENERAL;
+                if (et == feedback_tex[k] && feedback_any_type[k]) view = feedback_view[k], layout = VK_IMAGE_LAYOUT_GENERAL, lb = NULL;
                 else if (et == feedback_tex[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
                     view = feedback_view[k];
                     layout = VK_IMAGE_LAYOUT_GENERAL;
-                    if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY);  // (2D snapshot as array: rare)
+                    lb = feedback_be[k];  // (the bound depth target read live: its layout; a snapshot copy: GENERAL)
+                    if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY), lb = NULL;  // (2D snapshot as array: rare)
                 }
             NvnTexture *cascades = st_->shadow ? shadow_copy_source(et) : NULL;  // (the copy's readers: the cascades)
             if (cascades) {
                 VkImageView v = vk_view(cascades, &e->view, e->has_view, false, st_->type);
-                if (v) view = v, layout = VK_IMAGE_LAYOUT_GENERAL;
+                if (v) view = v, layout = VK_IMAGE_LAYOUT_GENERAL, lb = (TexBackend *)cascades->backend;
             }
             TexBackend *eb = (TexBackend *)et->backend;
             if (st_->shadow && !cascades && view && eb && !(e->has_view && (e->view.setmask & 3))) {
                 VkImageView v = depth_twin_sample(eb, st_->type, stage == 5 && !vk_is_shadow_copy(et));  // (its depth twin)
-                if (v) view = v, layout = VK_IMAGE_LAYOUT_GENERAL;
+                if (v) view = v, layout = VK_IMAGE_LAYOUT_GENERAL, lb = NULL;
+            }
+            if (dl_tracked(lb) && view) {  // (depth layout tracking: in DL_RO here, dl_prepare_draw / dl_prepare_stage)
+                if (lb->dl != DL_RO && lb->dl != DL_GENERAL) {
+                    static int nlog;
+                    if (nlog++ < 10) LOG("[vk] depth target %ux%u sampled in layout %d (fs %016llx): a missed move\n", lb->width,
+                                         lb->height, lb->dl, (unsigned long long)g_cur_fs_hash);
+                }
+                layout = lb->dl == DL_GENERAL ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
             }
         }
     }
@@ -8071,6 +8478,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         LOG("\n");
     }
     nfeedback = 0;
+    memset(feedback_be, 0, sizeof feedback_be);
+    dl_prepare_stage(5, cp->si, NULL, NULL);  // (depth targets the dispatch samples in their resting layout)
+    dl_flush(cb);
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL, NULL, NULL);
     rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
@@ -8579,8 +8989,10 @@ static void draw_(CmdRec *r, bool indexed) {
         prof_gw_check += now - prof_stage_start;
         prof_stage_start = now;
     }
+    dl_prepare_draw(pr);
     begin_pass();
     if (pass_void) { stat_skipped++; return; }
+    if (!dl_check_draw(pr)) { stat_skipped++; return; }
     // ---- motion vectors (mvec.c): an opaque draw of a pass with the motion target is recorded (its identity and the
     // vertex shader's inputs, for the next frame); matched with one of the previous frame, it is drawn with its motion
     // program: the vertex shader also run on the previous frame's inputs, the fragment shader also writing the distance
@@ -9519,6 +9931,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     uint32_t nz = (uint32_t)rg[5];
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
+    VkImageLayout il = dl_for_transfer(cb, b, true);  // (a tracked depth target: written in GENERAL)
     uint64_t out_row = (uint64_t)wb * out_bpb;
     VkSpan s = vk_transient(out_row * hb * nz, 16);
     for (uint32_t z = 0; z < nz; z++)
@@ -9533,7 +9946,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
                                                 (uint32_t)level, array ? (uint32_t)rg[2] : 0, array ? nz : 1},
                            .imageOffset = {rg[0], rg[1], array ? 0 : rg[2]},
                            .imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], array ? 1 : nz}};
-    rec_CmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    rec_CmdCopyBufferToImage(cb, s.buf, b->image, il, 1, &c);
 }
 
 // (debugging) the last texture-to-buffer copies: backend_debug_copies_at logs those that wrote a guest address
@@ -9563,6 +9976,7 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     renderer_texture_scale(t, &tsx, &tsy);
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
+    VkImageLayout sl = dl_for_transfer(cb, b, false);  // (a tracked depth target: copied from as it is)
     VkImage srcimg = b->image;
     VmaAllocation small_mem = NULL;
     if ((tsx != 1 || tsy != 1) && level == 0 && !renderer_format_is_depth(t->format)) {
@@ -9592,8 +10006,9 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
         }
         VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{sx0, sy0, 0}, {sx1, sy1, 1}},
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)t->width, (int32_t)t->height, 1}}};
-        rec_CmdBlitImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, srcimg, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+        rec_CmdBlitImage(cb, b->image, sl, srcimg, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
         vk_full_barrier(cb);
+        sl = VK_IMAGE_LAYOUT_GENERAL;  // (the copy below reads the small image)
     }
     bool array = b->layers > 1 && b->depth == 1;
     uint32_t nz = (uint32_t)rg[5];
@@ -9605,7 +10020,7 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
                                                 (uint32_t)level, array ? (uint32_t)rg[2] : 0, array ? nz : 1},
                            .imageOffset = {rg[0], rg[1], array ? 0 : rg[2]},
                            .imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], array ? 1 : nz}};
-    rec_CmdCopyImageToBuffer(cb, srcimg, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    rec_CmdCopyImageToBuffer(cb, srcimg, sl, out.buf, 1, &c);
     renderer_flush();  // the CPU may read the result right after the fence
     kernel_watch_write("CopyTextureToBuffer", dst, total);
     hc_cpu_wrote(dst, total);
@@ -9692,18 +10107,22 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
             (unsigned long long)flags);
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
+    // (depth layout tracking: a tracked depth target is copied from in TRANSFER_SRC_OPTIMAL, compressed - the game's
+    // depth pyramid, every frame - and into in GENERAL; within one image, GENERAL)
+    VkImageLayout sl = s == d ? dl_for_self_copy(cb, s) : dl_for_transfer(cb, s, false);
+    VkImageLayout dl_ = s == d ? sl : dl_for_transfer(cb, d, true);
     VkImageAspectFlags sa = s->aspect, da = d->aspect;
     if (s->samples > 1 && d->samples == 1 && sw == dw && sh == dh && s->format == d->format && !(sa & VK_IMAGE_ASPECT_DEPTH_BIT)) {
         VkImageResolve rv = {.srcSubresource = {sa, slv, sly, 1}, .srcOffset = {sx0, sy0, 0}, .dstSubresource = {da, dlv, dly, 1},
                              .dstOffset = {dx0, dy0, 0}, .extent = {(uint32_t)sw, (uint32_t)sh, 1}};
-        rec_CmdResolveImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rv);
+        rec_CmdResolveImage(cb, s->image, sl, d->image, dl_, 1, &rv);
         return;
     }
     if (s->samples != d->samples) return;
     if (sw == dw && sh == dh && s->format == d->format) {
         VkImageCopy c = {.srcSubresource = {sa, slv, sly, 1}, .srcOffset = {sx0, sy0, 0}, .dstSubresource = {da, dlv, dly, 1},
                          .dstOffset = {dx0, dy0, 0}, .extent = {(uint32_t)sw, (uint32_t)sh, 1}};
-        rec_CmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        rec_CmdCopyImage(cb, s->image, sl, d->image, dl_, 1, &c);
         return;
     }
     // scaled / converting copy: the game builds its depth pyramid this way (nearest), colour copies filter if asked
@@ -9716,7 +10135,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     bool linear = (flags & 1) && !depth && !rt_kind(st_->format);
     dl_note("  blit %p lv%u/%u %ux%u (%d,%d %dx%d) -> %p lv%u/%u %ux%u (%d,%d %dx%d) %s", (void *)s->image, slv, s->levels, s->width,
             s->height, sx0, sy0, sw, sh, (void *)d->image, dlv, d->levels, d->width, d->height, dx0, dy0, dw, dh, linear ? "linear" : "nearest");
-    rec_CmdBlitImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    rec_CmdBlitImage(cb, s->image, sl, d->image, dl_, 1, &bl, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
 }
 
 // ================================================================== present helpers (device.c)
@@ -9783,9 +10202,13 @@ static VkImageView raw_view(TexBackend *b) {
 static VkPipelineLayout post_layout;
 static VkDescriptorSetLayout post_set_layout;
 
-static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
-    static struct { const char *fs; VkFormat f; VkPipeline p; } cache[16];
-    for (int i = 0; i < 16; i++) if (cache[i].p && cache[i].fs == fs && cache[i].f == fmt) return cache[i].p;
+// smode (post_pass_st): 0 no stencil; 1 the pass marks the pixels it writes (stencil 1 where the shader didn't discard);
+// 2 the pass runs only where stencil is 1. sfmt: the stencil attachment's format (smode 1, 2).
+static VkPipeline post_pipeline_st(const char *fs, VkFormat fmt, int smode, VkFormat sfmt);
+static VkPipeline post_pipeline(const char *fs, VkFormat fmt) { return post_pipeline_st(fs, fmt, 0, VK_FORMAT_UNDEFINED); }
+static VkPipeline post_pipeline_st(const char *fs, VkFormat fmt, int smode, VkFormat sfmt) {
+    static struct { const char *fs; VkFormat f; int sm; VkPipeline p; } cache[32];
+    for (int i = 0; i < 32; i++) if (cache[i].p && cache[i].fs == fs && cache[i].f == fmt && cache[i].sm == smode) return cache[i].p;
     if (!post_layout) {
         VkDescriptorSetLayoutBinding b[3];
         for (uint32_t i = 0; i < 3; i++)
@@ -9816,16 +10239,76 @@ static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn};
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
-                                        .pColorAttachmentFormats = &fmt};
+                                        .pColorAttachmentFormats = &fmt,
+                                        .stencilAttachmentFormat = smode ? sfmt : VK_FORMAT_UNDEFINED};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    if (smode) {
+        VkStencilOpState so = {.failOp = VK_STENCIL_OP_KEEP, .depthFailOp = VK_STENCIL_OP_KEEP, .compareMask = 0xFF, .reference = 1,
+                               .passOp = smode == 1 ? VK_STENCIL_OP_REPLACE : VK_STENCIL_OP_KEEP,
+                               .compareOp = smode == 1 ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_EQUAL,
+                               .writeMask = smode == 1 ? 0xFF : 0};
+        ds.stencilTestEnable = VK_TRUE;
+        ds.front = ds.back = so;
+    }
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 2,
                                        .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = post_layout};
     VkPipeline p;
     VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
-    for (int i = 0; i < 16; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].f = fmt; cache[i].p = p; break; }
+    for (int i = 0; i < 32; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].f = fmt; cache[i].sm = smode; cache[i].p = p; break; }
     return p;
+}
+
+// SMAA's stencil mask (post_process): which pixels its edge pass found an edge in, so the blending weight pass, the
+// costly one, runs on those alone, as SMAA is meant to be used (its edge pass discards the rest). Only ever a stencil
+// attachment, kept in DEPTH_STENCIL_ATTACHMENT_OPTIMAL. NULL: no stencil format to render to (the weights then run on
+// every pixel, as before).
+static VkFormat post_stencil_format(void) {
+    static VkFormat f = VK_FORMAT_MAX_ENUM;
+    if (f != VK_FORMAT_MAX_ENUM) return f;
+    static const VkFormat pref[] = {VK_FORMAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT};
+    f = VK_FORMAT_UNDEFINED;
+    for (int i = 0; i < 3 && f == VK_FORMAT_UNDEFINED; i++) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, pref[i], &fp);
+        if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) f = pref[i];
+    }
+    LOG("[post] SMAA stencil mask: %s (format %d)\n", f ? "on" : "off, no stencil format", (int)f);
+    return f;
+}
+static TexBackend *post_stencil(uint32_t w, uint32_t h) {
+    static TexBackend d;
+    VkFormat f = post_stencil_format();
+    if (!f) return NULL;
+    if (d.image && (d.width != w || d.height != h)) {
+        vk_views_forget(&d);
+        vk_defer_image(d.image, d.mem);
+        d.image = VK_NULL_HANDLE;
+        d.mem = VK_NULL_HANDLE;
+    }
+    if (!d.image) {
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
+                                .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(g_vk.vma, &ci, &ai, &d.image, &d.mem, NULL) != VK_SUCCESS) {
+            d.image = VK_NULL_HANDLE;
+            return NULL;
+        }
+        d.format = f; d.width = w; d.height = h; d.depth = 1; d.layers = 1; d.levels = 1; d.samples = 1;
+        d.aspect = f == VK_FORMAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        d.base_type = VK_IMAGE_VIEW_TYPE_2D;
+        VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+                                    .dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                                    .dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .image = d.image, .subresourceRange = {d.aspect, 0, 1, 0, 1}};
+        rec_CmdPipelineBarrier2(vk_cmd(), &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                                              .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib});
+    }
+    return &d;
 }
 
 // Post image `i` at w x h in format f (kept until the size or format changes). 0, 1: SMAA edges / weights, 2: SMAA
@@ -9942,9 +10425,11 @@ static VkImageView smaa_lut(int i) {
 
 // One post pass (outside the window image's rendering): srcs (bindings 0..n-1) -> dst, fragment shader `fs`.
 // clear: start from zero (SMAA's edge pass only writes edge pixels; its weights / output read them).
-static void post_pass_pc(VkCommandBuffer cb, const char *fs, const VkImageView *srcs, int n, TexBackend *dst, const float *pc,
-                         uint32_t pc_bytes, bool clear) {
-    VkPipeline pipe = post_pipeline(fs, dst->format);  // (before the rendering begins: created inside it, the NVIDIA driver crashed)
+// (smode, sten: post_pipeline_st's stencil use, and the stencil image; smode 0: none)
+static void post_pass_st(VkCommandBuffer cb, const char *fs, const VkImageView *srcs, int n, TexBackend *dst, const float *pc,
+                         uint32_t pc_bytes, bool clear, int smode, TexBackend *sten) {
+    if (!sten) smode = 0;
+    VkPipeline pipe = post_pipeline_st(fs, dst->format, smode, smode ? sten->format : VK_FORMAT_UNDEFINED);  // (before the rendering begins: created inside it, the NVIDIA driver crashed)
     vk_full_barrier(cb);
     gp_mark(cb, "post %s %ux%u", fs, dst->width, dst->height);
     ck_mark(cb, fs, dst->width, dst->height, 0, 0, 0, 0);
@@ -9952,8 +10437,17 @@ static void post_pass_pc(VkCommandBuffer cb, const char *fs, const VkImageView *
                                     .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                                     .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
                                     .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingAttachmentInfo sa = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    if (smode) {
+        static const VkComponentMapping id = {0};
+        sa.imageView = vk_image_view(sten, VK_IMAGE_VIEW_TYPE_2D, sten->format, 0, 1, 0, 1, id, sten->aspect);
+        sa.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        sa.loadOp = smode == 1 ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;  // (cleared to 0: no edge)
+        sa.storeOp = smode == 1 ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    }
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {dst->width, dst->height}},
-                          .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca};
+                          .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca,
+                          .pStencilAttachment = smode ? &sa : NULL};
     rec_CmdBeginRendering(cb, &ri);
     VkDescriptorSet ds = vk_alloc_set(post_set_layout);
     VkDescriptorImageInfo ii[3];
@@ -9975,6 +10469,11 @@ static void post_pass_pc(VkCommandBuffer cb, const char *fs, const VkImageView *
     rec_CmdPushConstants(cb, post_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pc_bytes, pc);
     rec_CmdDraw(cb, 3, 1, 0, 0);
     rec_CmdEndRendering(cb);
+}
+
+static void post_pass_pc(VkCommandBuffer cb, const char *fs, const VkImageView *srcs, int n, TexBackend *dst, const float *pc,
+                         uint32_t pc_bytes, bool clear) {
+    post_pass_st(cb, fs, srcs, n, dst, pc, pc_bytes, clear, 0, NULL);
 }
 
 static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *srcs, int n, TexBackend *dst, const float pc[8],
@@ -10059,10 +10558,16 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         const VkFormat f8 = hdr_src ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
         TexBackend *edges = post_image(0, b->width, b->height, f8), *weights = post_image(1, b->width, b->height, f8);
         TexBackend *out = post_image(2, b->width, b->height, f8);
+        // The edge pass marks its edge pixels in a stencil mask (its shader discards the others) and the weight pass,
+        // most of SMAA's cost, runs on those only: the others' weights are the clear's zeros, as the shader returns
+        // there (2560x1440 on an RX 580: 0.76 ms of weights). SAVAGEWIND_SMAA_STENCIL=0: every pixel, as before.
+        static int sm_st = -1;
+        if (sm_st < 0) sm_st = !getenv("SAVAGEWIND_SMAA_STENCIL") || atoi(getenv("SAVAGEWIND_SMAA_STENCIL")) != 0;
+        TexBackend *sten = sm_st ? post_stencil(b->width, b->height) : NULL;
         VkImageView in[3] = {v};
-        post_pass(cb, "smaa_edge.frag", in, 1, edges, m, true);
+        post_pass_st(cb, "smaa_edge.frag", in, 1, edges, m, 32, true, 1, sten);
         VkImageView wi[3] = {post_view(edges), smaa_lut(0), smaa_lut(1)};
-        post_pass(cb, "smaa_weight.frag", wi, 3, weights, m, true);
+        post_pass_st(cb, "smaa_weight.frag", wi, 3, weights, m, 32, true, 2, sten);
         VkImageView bi[3] = {v, post_view(weights)};
         post_pass(cb, "smaa_blend.frag", bi, 2, out, m, false);
         v = post_view(out);
@@ -10462,6 +10967,8 @@ static void scene_post(Prog *pr, CmdRec *r) {
             LOG("[post] scene %ux%u%s%s%s%s -> %ux%u%s (format %d)\n", b->width, b->height, grade ? " graded" : "",
                 taa ? " taa" : "", dlss ? " dlss" : up ? " fsr1" : "", f3 ? " fsr3" : "", w, h, cas ? taa ? " rcas" : " cas" : "", b->format);
         lw = b->width; lh = b->height; low = w; loh = h; lcas = g_settings.sharpening; ltaa = !!taa; lf3 = !!f3; lgrade = grade;
+        g_scene_px = (double)b->width * b->height;  // (GPU-timed counters: the size the game draws its scene at now)
+        if (g_scene_px > g_scene_px_max) g_scene_px_max = g_scene_px;
         return;
     }
 }
@@ -10755,6 +11262,7 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
         TexBackend *db = vk_tex(fg.cand[best].depth, true);
         vk_end_pass();
         VkCommandBuffer cb = vk_cmd();
+        dl_general(cb, db);  // (sampled in GENERAL below)
         TexBackend *mv = fg_image(1, db->width, db->height, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
         gp_mark(cb, "frame generation: motion vectors");
         bool link = fg.cand[best].has_link && !reset && fg.have_prev_link;
@@ -10879,6 +11387,7 @@ static TexBackend *dlss_scene(VkCommandBuffer cb, TexBackend *color, uint32_t ow
         dl.have_prev = false;
         return NULL;
     }
+    dl_general(cb, db);  // (depth layout tracking: NGX reads it in GENERAL)
     static int history = -1, lg = -1;
     if (history < 0) history = getenv("SAVAGEWIND_DLSS_HISTORY") ? atoi(getenv("SAVAGEWIND_DLSS_HISTORY")) : 1;
     if (lg < 0) lg = getenv("SAVAGEWIND_DLSS_LOG") != NULL;
@@ -10894,6 +11403,7 @@ static TexBackend *dlss_scene(VkCommandBuffer cb, TexBackend *color, uint32_t ow
     bool jittered = mvec_camera_now(jit, &nr, &fr, &fov) && rt_jitter_on();
     if (!jittered) jit[0] = jit[1] = 0;
     if (objv) db = od;
+    dl_general(cb, db);
     TexBackend *mv = post_image_ex(35, db->width, db->height, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     bool reset = true, moved = false;
     if (best >= 0) {
@@ -11008,6 +11518,7 @@ static bool mvec_scene_view(Prog *pr, CmdRec *r, NvnTexture **taa_t, TexBackend 
             mvec_filled = frame;
             vk_end_pass();
             VkCommandBuffer cb = vk_cmd();
+            dl_general(cb, db);  // (depth layout tracking: sampled in GENERAL below)
             static const VkComponentMapping id = {0};
             VkImageView dv = vk_image_view(db, VK_IMAGE_VIEW_TYPE_2D, db->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
             mvec_vectors_img = post_image(10, mvec_target_img->width, mvec_target_img->height, mvec_target_img->format);
@@ -11069,6 +11580,7 @@ static TexBackend *mvec_taa(VkCommandBuffer cb, TexBackend *b, uint64_t frame) {
     }
     float jit[2], nr, fr, fov;
     if (!mvec_camera_now(jit, &nr, &fr, &fov)) return NULL;
+    dl_general(cb, db);  // (depth layout tracking: sampled in GENERAL below)
     static uint64_t last = ~0ull;
     static uint32_t lw, lh;
     static int n;
@@ -11216,6 +11728,7 @@ static TexBackend *fsr3_scene(VkCommandBuffer cb, TexBackend *b, uint32_t ow, ui
                                 v ? v->width : 0, v ? v->height : 0, db ? db->width : 0, db ? db->height : 0);
     lwhy = why;
     if (why) return NULL;
+    dl_general(cb, db);  // (depth layout tracking: read in GENERAL below)
     uint32_t w = b->width, h = b->height;
     static const VkComponentMapping id = {0};
     TexBackend *dep = post_image(14, w, h, VK_FORMAT_R32_SFLOAT), *rea = post_image(15, w, h, VK_FORMAT_R8_UNORM);
@@ -11816,6 +12329,40 @@ static void exec_list(uint64_t handle, int depth) {
                 }
                 pthread_mutex_unlock(&readback_lock);
                 break;
+            }
+            if ((type == 0 || type == 16) && out && g_settings.dynamic_res && ts_on()) {  // (GPU-timed counters, ts_apply)
+                pthread_mutex_lock(&readback_lock);
+                if (ts_nreports == 64) ts_apply();
+                bool room = ts_nreports < 64;
+                pthread_mutex_unlock(&readback_lock);
+                if (room) {  // (the commands without the lock: taking a command buffer can submit, and that applies readbacks)
+                    uint32_t q = ts_next++ % TSQ_SLOTS;
+                    VkCommandBuffer cb = vk_cmd();
+                    rec_CmdResetQueryPool(vk_upload_cmd(), ts_pool, q, 1);  // (the upload buffer runs first)
+                    rec_CmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, ts_pool, q);
+                    uint64_t seq = vk_pending_seq();
+                    // the frame's counters on one time line from its first (the time it is translated), offset as in the
+                    // last measured frame, scaled so the frame reports drs_report's time
+                    static uint64_t frame = ~0ull, anchor;
+                    static uint32_t idx;
+                    static double scale;
+                    if (renderer_present_count() != frame) {
+                        frame = renderer_present_count(), anchor = ts, idx = 0;
+                        int why;
+                        double rep = drs_report(&why);
+                        scale = ts_full > 0 && ts_last_span > 0 ? rep / ts_last_span : 0;
+                    }
+                    uint32_t i = idx++;
+                    uint64_t prov = scale > 0 && i < TS_PER_FRAME && ts_have_off[i] ? anchor + (uint64_t)(ts_last_off[i] * scale)
+                                                                                    : ts;
+                    kernel_watch_write("ReportCounter", r->x[1], 16);
+                    out[0] = 0;
+                    out[1] = prov;
+                    pthread_mutex_lock(&readback_lock);
+                    if (ts_nreports < 64) ts_reports[ts_nreports++] = (TsReport){r->x[1], seq, q, i, g_scene_px};
+                    pthread_mutex_unlock(&readback_lock);
+                    break;
+                }
             }
             kernel_watch_write("ReportCounter", r->x[1], 16);
             if (out) { out[0] = 0; out[1] = ts; }

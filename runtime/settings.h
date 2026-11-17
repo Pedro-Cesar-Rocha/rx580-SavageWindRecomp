@@ -30,8 +30,8 @@ enum { AA_OFF = 0, AA_SMAA = 1, AA_TAA = 2 };
 enum { AA_ROW_OFF, AA_ROW_FXAA, AA_ROW_SMAA, AA_ROW_TAA, AA_ROW_COUNT };
 int settings_aa_row(void);
 void settings_aa_row_set(int row);
-// Video > Render scale: 50%, 75%, 100% (the window's size), 125%, 150%, 200%
-enum { RSCALE_50 = 0, RSCALE_75 = 1, RSCALE_100 = 2, RSCALE_125 = 3, RSCALE_150 = 4, RSCALE_200 = 5, RSCALE_COUNT };
+// Video > Render scale: 50%, 75%, 100% (the window's size), 125%, 133% (1440 lines from a 1080-line window), 150%, 200%
+enum { RSCALE_50 = 0, RSCALE_75 = 1, RSCALE_100 = 2, RSCALE_125 = 3, RSCALE_133 = 4, RSCALE_150 = 5, RSCALE_200 = 6, RSCALE_COUNT };
 #ifdef __APPLE__
 #define AA_TAA_OR_SMAA AA_SMAA
 #else
@@ -92,7 +92,7 @@ typedef struct {
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
     bool game_fxaa;      // the game's own FXAA, in its scene -> final image composite (vulkan/exec.c fxaa_patch)
     bool wet_fix;        // Video > Wet grass fix: tames the white glare of rain in sunshine (maxwell/translate.c maxwell_wet_lighting)
-    int render_scale;    // 50%, 75%, 100% (RSCALE_100: the window's size), 125%, 150%, 200% (nvn/output_scale.c)
+    int render_scale;    // 50%, 75%, 100% (RSCALE_100: the window's size), 125%, 133%, 150%, 200% (nvn/output_scale.c)
     int anisotropy;      // texture filtering: 0 the game's own, 1..4 = 2x, 4x, 8x, 16x (vulkan/textures.c)
     int tex_lod_bias;    // TEX_LOD_*: texture LOD bias, 0 = default (0.0), 1 = sharp (-0.5), 2 = sharper (-1.0)
     int sharpening;      // AMD CAS sharpening of the 3D image, 0 (off) .. 10 (100%) (vulkan/exec.c scene_post)

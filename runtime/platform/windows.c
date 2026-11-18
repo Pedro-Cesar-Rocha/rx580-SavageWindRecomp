@@ -146,6 +146,9 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep) {
 // MEM_WRITE_WATCH: Windows keeps which pages were written (plat_written_pages; the Vulkan backend refreshes its copy of
 // the heap's geometry from it). SAVAGEWIND_NO_WRITE_WATCH=1, or a system that refuses it: a plain reservation.
 static bool g_write_watch;
+// (plat_written_since) the number of the latest reset that found each 4K page of the window written: 4 bytes a page,
+// committed as Windows hands out zero pages (only the ones touched take memory)
+static uint32_t *g_ww_epoch, g_ww_now;
 
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     void *p = NULL;
@@ -158,6 +161,8 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     if (p != (void *)(uintptr_t)lo) return false;
     g_lo = lo;
     g_hi = hi;
+    if (g_write_watch && !g_ww_epoch)
+        g_ww_epoch = VirtualAlloc(NULL, ((hi - lo) >> 12) * sizeof *g_ww_epoch, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     AddVectoredExceptionHandler(1, vectored_handler);
     return true;
 }
@@ -167,7 +172,26 @@ long plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t ma
     ULONG_PTR n = max;
     DWORD gran;
     if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)addr, size, (void **)pages, &n, &gran) != 0) return -1;
+    if (g_ww_epoch) {  // (plat_written_since) this reset's number on the pages it found written; a full list: on all
+        uint32_t e = __atomic_add_fetch(&g_ww_now, 1, __ATOMIC_RELAXED);
+        if (n >= max)
+            for (uint64_t a = addr & ~0xFFFull; a < addr + size; a += 0x1000)
+                __atomic_store_n(&g_ww_epoch[(a - g_lo) >> 12], e, __ATOMIC_RELAXED);
+        else
+            for (ULONG_PTR i = 0; i < n; i++) __atomic_store_n(&g_ww_epoch[(pages[i] - g_lo) >> 12], e, __ATOMIC_RELAXED);
+    }
     return n >= max ? -1 : (long)n;  // (a full list may have left pages out)
+}
+
+uint32_t plat_written_epoch(void) { return __atomic_load_n(&g_ww_now, __ATOMIC_RELAXED); }
+
+int plat_written_since(uint64_t addr, uint64_t size, uint32_t epoch) {
+    if (!g_ww_epoch || !size) return -1;
+    int now = plat_any_written(addr, size);
+    if (now != 0) return now;
+    for (uint64_t i = (addr - g_lo) >> 12, end = (addr + size - 1 - g_lo) >> 12; i <= end; i++)
+        if (__atomic_load_n(&g_ww_epoch[i], __ATOMIC_RELAXED) > epoch) return 1;
+    return 0;
 }
 
 int plat_any_written(uint64_t addr, uint64_t size) {

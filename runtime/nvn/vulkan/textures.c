@@ -170,6 +170,43 @@ static bool format_is_float(VkFormat f) {  // (uncompressed: these can hold NaN 
     }
 }
 
+// On AMD's own driver for GCN chips (g_vk.amd_gcn), a single-level colour target that is not a multiple of 256 texels
+// wide and 128 rows tall is laid out so that the GPU reaches it at half speed: 2560x1440 clears at ~64 GB/s and copies
+// at ~102, 2560x1408 at ~129 and ~184 (SAVAGEWIND_VK_MEMBENCH; its memory alignment is 2 KB where an aligned one's is
+// 128 KB). Made with a second mip level, the same 2560x1440 image is laid out as the aligned ones are (padded to powers
+// of two, 42 MB in place of 15) and is as fast. That level is never viewed, drawn into or sampled: b->levels stays the
+// game's one, and views are made of those (vk_image_view callers). Depth / stencil targets the same (D32S8 2560x1440:
+// cleared in 0.265 ms, 0.130 with the level; at 2560x1440 the GPU took 8.28 ms a frame on the Great Plateau with colour
+// targets so made, 7.63 with depth targets too). The memory: ~450 MB more at 2560x1440. vk_fast_levels: the levels to
+// make such an image with. SAVAGEWIND_VK_POW2_TARGETS=0: off, 1: on, 2: colour targets only (default: on with
+// g_vk.amd_gcn and 6 GB of video memory or more).
+static int pow2_targets = -1;
+bool vk_pow2_targets(void) {
+    if (pow2_targets < 0) {
+        const char *e = getenv("SAVAGEWIND_VK_POW2_TARGETS");
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+        uint64_t local = 0;
+        for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+            if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > local) local = mp.memoryHeaps[i].size;
+        pow2_targets = e && *e ? atoi(e) : g_vk.amd_gcn && local >= (6ull << 30);
+        if (pow2_targets)
+            LOG("[vk] %s targets not 256x128 aligned: made with a hidden second level (the fast layout)\n",
+                pow2_targets == 2 ? "colour" : "colour and depth");
+    }
+    return pow2_targets != 0;
+}
+uint32_t vk_fast_levels(const VkImageCreateInfo *ci) {
+    if (!vk_pow2_targets()) return ci->mipLevels;
+    VkImageUsageFlags want = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (pow2_targets != 2 ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
+    if (ci->mipLevels != 1 || ci->arrayLayers != 1 || ci->imageType != VK_IMAGE_TYPE_2D || ci->samples != VK_SAMPLE_COUNT_1_BIT ||
+        !(ci->usage & want) || (ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT))
+        return ci->mipLevels;
+    uint32_t w = ci->extent.width, h = ci->extent.height;
+    if (w < 256 || h < 128 || (w % 256 == 0 && h % 128 == 0)) return ci->mipLevels;
+    return 2;
+}
+
 // ================================================================== output resolution / per-frame clears
 // Render targets are allocated at one of two scales (runtime/nvn/output_scale.c sets both every presented frame):
 //   RS_OUT    the game's final image (1920x1080, its halves) and the display images: the window's resolution, so the
@@ -221,7 +258,7 @@ void renderer_set_scene_scale(float sx, float sy) {
     static int a = -1;
     if (a < 0) {
         const char *e = getenv("SAVAGEWIND_VK_ALIGN_ROWS");
-        a = e && *e ? atoi(e) : g_vk.amd_gcn ? 128 : 0;
+        a = e && *e ? atoi(e) : g_vk.amd_gcn && !vk_pow2_targets() ? 128 : 0;  // (vk_fast_levels: as fast, at the size asked)
         if (a > 0) LOG("[vk] 3D scene targets: %d pixels wide and %d rows tall multiples where near\n", 2 * a, a);
     }
     if (a > 0) {  // (BOTW's scene targets, docked: 1600x900)
@@ -698,6 +735,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
                             .extent = {tw, th, depth}, .mipLevels = levels, .arrayLayers = layers,
                             .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    ci.mipLevels = vk_fast_levels(&ci);  // (a hidden second level: the fast layout; b->levels stays levels)
     const bool sparse = plat_guest_sparse_heap_enabled();
     VmaAllocationCreateInfo ai = image_allocation_info(&ci);
     // 2D color targets may be sampled by the draws that render into them (exec.c resolve_feedback: a feedback loop)
@@ -759,6 +797,16 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         (ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && b->nview_fmt && !(t->flags & 0x40) && !hdr_up &&
         b->rs_group != RS_OUT && !b->feedback_ok && vk_color_layouts())
         b->dl_ok = true;
+    if (ci.mipLevels != levels) {
+        static int nlog;
+        static uint64_t total;
+        VmaAllocationInfo inf;
+        vmaGetAllocationInfo(g_vk.vma, b->mem, &inf);
+        total += inf.size;
+        if (nlog++ < 60 || (nlog & 63) == 0)
+            LOG("[vk] %ux%u target (format %d) with a hidden level: %llu KB (%d so far, %llu MB)\n", tw, th, (int)ci.format,
+                (unsigned long long)(inf.size >> 10), nlog, (unsigned long long)(total >> 20));
+    }
     b->cube_ok = (ci.flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0;
     b->not_attachable = !(ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
     static uint64_t serials;
@@ -1312,11 +1360,35 @@ static void upload_texture(NvnTexture *t, TexBackend *b, bool written) {
     if (always_full < 0) always_full = getenv("SAVAGEWIND_TEX_FULLHASH") ? 1 : 0;
     bool full = b->dynamic || !b->uploaded || always_full;
     if (!full && frame - b->full_frame >= 120 && full_hash_budget >= total) { full = true; full_hash_budget -= total; }
+    // Windows' write watch (plat_written_since): no page of it written since the last full look - the same texels,
+    // without reading them (~2000 scattered reads for a large texture, ~70 textures a frame). Each full look resets the
+    // write watch over the texture first (the pages found written: hc_cpu_wrote, so the copy of the heap's geometry
+    // still sees them). Not where shaders store (the GPU's writes don't show there: vk_gw_overlaps), nor for the
+    // periodic full hash below. SAVAGEWIND_TEX_WRITE_WATCH=0: off.
+    static int ww_on = -1;
+    if (ww_on < 0) ww_on = !getenv("SAVAGEWIND_TEX_WRITE_WATCH") || atoi(getenv("SAVAGEWIND_TEX_WRITE_WATCH"));
+    bool ww = ww_on && !vk_gw_overlaps(t->addr, t->addr + total);
+    if (ww && b->ww_ok && !written && !(full && !b->dynamic)) {
+        uint32_t now = plat_written_epoch();
+        if (plat_written_since(t->addr, total, b->ww_epoch) == 0) {
+            SW_TALLY("tex/unwritten");
+            b->ww_epoch = now;
+            return;
+        }
+    }
     if (!full) {
         prof_tex_samples++;
         SW_TALLY("tex/sampled");
         uint64_t sh = fnv_sample(mem, total);
         if (sh == b->sample_hash) return;
+    }
+    if (ww) {  // (the full look below: what memory holds from here on, written or not since, is what it reads)
+        uint64_t lo = t->addr & ~0xFFFull, hi = (t->addr + total + 0xFFF) & ~0xFFFull, pages[256];
+        long n = plat_written_pages(lo, hi - lo, pages, 256);
+        if (n < 0) vk_hc_cpu_wrote(lo, hi - lo);
+        for (long k = 0; k < n; k++) vk_hc_cpu_wrote(pages[k], 0x1000);
+        b->ww_epoch = plat_written_epoch();  // (after its own reset: that reset's number is not a write)
+        b->ww_ok = n >= 0 || plat_written_since(t->addr, total, b->ww_epoch) >= 0;
     }
     prof_tex_full++; prof_tex_full_bytes += total; if (b->dynamic) prof_tex_dyn++;
     if (b->dynamic) SW_TALLY("tex/full hash (dynamic)");

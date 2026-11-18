@@ -48,6 +48,11 @@ long plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t ma
 // Whether any 4K page of [addr, addr + size) was written since plat_written_pages last reset it (1 / 0), without
 // resetting anything. -1: not known here.
 int plat_any_written(uint64_t addr, uint64_t size);
+// Every reset by plat_written_pages is numbered (plat_written_epoch: the latest number) and leaves its number on the
+// pages it found written. plat_written_since: whether any page of [addr, addr + size) was written after reset number
+// `epoch` was taken: written now (not reset since), or found written by a later reset (1 / 0); -1: not known here.
+uint32_t plat_written_epoch(void);
+int plat_written_since(uint64_t addr, uint64_t size, uint32_t epoch);
 
 // ---- time
 uint64_t plat_now_ns(void);                // monotonic

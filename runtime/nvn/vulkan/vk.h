@@ -129,6 +129,8 @@ typedef struct TexBackend {
     VkFormat view_fmt[2];    // (g_vk.lean_usage) the only formats its views may have; nview_fmt 0: any compatible one
     uint8_t nview_fmt;
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
+    uint32_t ww_epoch;           // (textures.c upload_texture) plat_written_epoch() at its last look at guest memory
+    bool ww_ok;                  // ... which found it as uploaded: unwritten since (plat_written_since), it still is
     bool scalable, presented;
     bool native_post;           // shader-identified bloom target: never inherit a scene scale
     bool hdr_upgraded;           // the game's linear 10-bit final image, made RGBA16F for HDR (hdr.c)
@@ -229,6 +231,10 @@ void vk_dl_upload(VkCommandBuffer upload_cb, TexBackend *b, bool before);  // ar
 // Destruction once every submission that may use the object has completed.
 void vk_defer_image(VkImage img, VmaAllocation mem);
 void vk_defer_view(VkImageView v);
+bool vk_gw_overlaps(uint64_t lo, uint64_t hi);  // (exec.c) [lo, hi) is where shaders store: the GPU writes guest memory there
+void vk_hc_cpu_wrote(uint64_t addr, uint64_t size);  // (exec.c) the CPU wrote there: out of the heap copy (write watch reset elsewhere)
+bool vk_pow2_targets(void);  // (textures.c) colour / depth targets not 256x128 aligned are made with a hidden level
+uint32_t vk_fast_levels(const VkImageCreateInfo *ci);  // (textures.c) the levels to make such an image with
 void vk_views_forget(TexBackend *b);  // drop (deferred) the cached views of an image being replaced
 void vk_make_scalable_like(NvnTexture *t, NvnTexture *like);  // a pass's attachments share one scale
 bool vk_native_post_target(NvnTexture *t);  // before its first write; contents may be discarded

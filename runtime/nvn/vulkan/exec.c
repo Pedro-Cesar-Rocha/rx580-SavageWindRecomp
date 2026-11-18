@@ -199,6 +199,7 @@ void gpu_lock(void) { pthread_once(&gpu_mutex_once, gpu_mutex_init); pthread_mut
 void gpu_unlock(void) { pthread_mutex_unlock(&gpu_mutex); }
 
 static void readbacks_apply(void);
+static void readbacks_apply_(bool wait);
 static void hc_cpu_wrote(uint64_t addr, uint64_t size);
 static bool hc_all_stale;  // a shader stored to guest memory where gw_note could not tell: the next list copies all geometry
 uint64_t vk_completed_seq(void) {
@@ -1655,12 +1656,13 @@ const char *renderer_stats(void) {
 
 static uint64_t vbuf_gen = 1;
 static uint64_t ubuf_gen[6] = {1, 1, 1, 1, 1, 1};
+static uint64_t sbuf_gen[6] = {1, 1, 1, 1, 1, 1};  // (bumped at every storage buffer bind: cbuf_info's driver constants)
 static uint64_t rt_gen = 1, tex_gen[6] = {1, 1, 1, 1, 1, 1};
 
 static void st_defaults(void) {
     memset(&st, 0, sizeof st);
     vbuf_gen++;
-    for (int i = 0; i < 6; i++) ubuf_gen[i]++;
+    for (int i = 0; i < 6; i++) ubuf_gen[i]++, sbuf_gen[i]++;
     rt_gen++;
     for (int i = 0; i < 6; i++) tex_gen[i]++;
     for (int i = 0; i < 16; i++) {
@@ -1677,8 +1679,15 @@ static void st_defaults(void) {
     for (int i = 0; i < 8; i++) { st.blend[i][1] = 2; st.blend[i][2] = 1; st.blend[i][3] = 2; st.blend[i][4] = 1; st.blend[i][5] = 1; st.blend[i][6] = 1; }
 }
 
-// (debugging) SAVAGEWIND_VK_MEMBENCH=1: at start, how fast the GPU writes memory - a fill of 256 MB, and colour targets
-// of several kinds cleared in GENERAL (as every target lives here) - in [membench] lines (best of 40), then on as usual
+static bool format_ok(VkFormat f, bool depth) {  // (vk_membench) can be drawn into
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g_vk.phys, f, &fp);
+    return fp.optimalTilingFeatures & (depth ? VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
+}
+
+// (debugging) SAVAGEWIND_VK_MEMBENCH=1: at start, how fast the GPU writes memory - a fill of 256 MB, and colour and
+// depth targets of several kinds cleared and copied in GENERAL (as every target lives here) - in [membench] lines (best
+// of 40, with each image's memory size and alignment), then on as usual
 static void vk_membench(void) {
     VkCommandPool pool;
     VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = g_vk.qfam};
@@ -1689,23 +1698,32 @@ static void vk_membench(void) {
     vkAllocateCommandBuffers(g_vk.dev, &cai, &cb);
     const VkImageUsageFlags G = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, CA = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    static const struct { const char *name; VkFormat f; uint32_t w, h, flags, usage_sel; } V[] = {
-        {"R11G11B10F 800x450", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 800, 450, 1, 0},
-        {"R11G11B10F 800x448", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 800, 448, 1, 0},
-        {"R11G11B10F 800x384", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 800, 384, 1, 0},
-        {"R11G11B10F 800x512", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 800, 512, 1, 0},
-        {"R11G11B10F 800x640", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 800, 640, 1, 0},
-        {"R11G11B10F 1280x720", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1280, 720, 1, 0},
-        {"R11G11B10F 1280x768", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1280, 768, 1, 0},
-        {"R11G11B10F 1600x900", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1600, 900, 1, 0},
-        {"R11G11B10F 1600x896", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1600, 896, 1, 0},
-        {"R11G11B10F 1600x1024", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1600, 1024, 1, 0},
-        {"R11G11B10F 1920x1080", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1920, 1080, 1, 0},
-        {"R11G11B10F 1920x1024", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1920, 1024, 1, 0},
-        {"R11G11B10F 1920x1152", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1920, 1152, 1, 0},
-        {"R11G11B10F 2560x1440", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 2560, 1440, 1, 0},
-        {"R11G11B10F 2560x1408", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 2560, 1408, 1, 0},
+    // ah: rows made (0: h; the clear and the copy cover w x h), mips: levels made (the clear and the copy: level 0)
+    static const struct { const char *name; VkFormat f; uint32_t w, h, flags, usage_sel, ah, mips, layers; } V[] = {
+        {"R11G11B10F 2560x1440", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 2560, 1440, 1, 0, 0, 1, 1},
+        {"R11G11B10F 2560x1408", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 2560, 1408, 1, 0, 0, 1, 1},
+        {"2560x1440 2 mips", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 2560, 1440, 1, 0, 0, 2, 1},
+        {"RGBA16F 2560x1440", VK_FORMAT_R16G16B16A16_SFLOAT, 2560, 1440, 1, 0, 0, 1, 1},
+        {"RGBA16F 2560x1440 2 mips", VK_FORMAT_R16G16B16A16_SFLOAT, 2560, 1440, 1, 0, 0, 2, 1},
+        {"R11G11B10F 1920x1080", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1920, 1080, 1, 0, 0, 1, 1},
+        {"1920x1080 2 mips", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1920, 1080, 1, 0, 0, 2, 1},
+        {"R11G11B10F 1067x600", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1067, 600, 1, 0, 0, 1, 1},
+        {"1067x600 2 mips", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 1067, 600, 1, 0, 0, 2, 1},
+        {"R11G11B10F 800x450", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 800, 450, 1, 0, 0, 1, 1},
+        {"800x450 2 mips", VK_FORMAT_B10G11R11_UFLOAT_PACK32, 800, 450, 1, 0, 0, 2, 1},
+        {"D32S8 2560x1440", VK_FORMAT_D32_SFLOAT_S8_UINT, 2560, 1440, 0, 0, 0, 1, 1},
+        {"D32S8 2560x1408", VK_FORMAT_D32_SFLOAT_S8_UINT, 2560, 1408, 0, 0, 0, 1, 1},
+        {"D32S8 2560x1440 2 mips", VK_FORMAT_D32_SFLOAT_S8_UINT, 2560, 1440, 0, 0, 0, 2, 1},
+        {"D24S8 2560x1440", VK_FORMAT_D24_UNORM_S8_UINT, 2560, 1440, 0, 0, 0, 1, 1},
+        {"D24S8 2560x1408", VK_FORMAT_D24_UNORM_S8_UINT, 2560, 1408, 0, 0, 0, 1, 1},
+        {"D24S8 2560x1440 2 mips", VK_FORMAT_D24_UNORM_S8_UINT, 2560, 1440, 0, 0, 0, 2, 1},
+        {"D32F 2560x1440", VK_FORMAT_D32_SFLOAT, 2560, 1440, 0, 0, 0, 1, 1},
+        {"D32F 2560x1408", VK_FORMAT_D32_SFLOAT, 2560, 1408, 0, 0, 0, 1, 1},
+        {"D32F 2560x1440 2 mips", VK_FORMAT_D32_SFLOAT, 2560, 1440, 0, 0, 0, 2, 1},
     };
+#define MB_DEPTH(f) ((f) == VK_FORMAT_D32_SFLOAT_S8_UINT || (f) == VK_FORMAT_D24_UNORM_S8_UINT || (f) == VK_FORMAT_D32_SFLOAT)
+#define MB_ASPECT(f) (!MB_DEPTH(f) ? VK_IMAGE_ASPECT_COLOR_BIT : (f) == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT \
+                      : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
     enum { NV = sizeof V / sizeof V[0], NT = NV * 2 + 1 };
     VkQueryPool qp;
     VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = NT * 2};
@@ -1725,19 +1743,30 @@ static void vk_membench(void) {
     VkImageView iv[NV];
     double mb[NT], best[NT];
     for (int i = 0; i < NV; i++) {
-        VkImageUsageFlags u = V[i].usage_sel == 0 ? G : V[i].usage_sel == 1 ? CA : V[i].usage_sel == 2 ? CA | VK_IMAGE_USAGE_SAMPLED_BIT
+        VkImageUsageFlags u = MB_DEPTH(V[i].f) ? VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : V[i].usage_sel == 0 ? G : V[i].usage_sel == 1 ? CA : V[i].usage_sel == 2 ? CA | VK_IMAGE_USAGE_SAMPLED_BIT
                                                                                                     : CA | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = V[i].flags ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0,
-                                .imageType = VK_IMAGE_TYPE_2D, .format = V[i].f, .extent = {V[i].w, V[i].h, 1}, .mipLevels = 1,
-                                .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = u};
+        VkImageCreateFlags fl = V[i].flags ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = fl,
+                                .imageType = VK_IMAGE_TYPE_2D, .format = V[i].f, .extent = {V[i].w, V[i].ah ? V[i].ah : V[i].h, 1},
+                                .mipLevels = V[i].mips, .arrayLayers = V[i].layers, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = u};
         VmaAllocationCreateInfo iai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         img[i] = twin[i] = VK_NULL_HANDLE;
-        vmaCreateImage(g_vk.vma, &ci, &iai, &img[i], &im[i], NULL);
-        vmaCreateImage(g_vk.vma, &ci, &iai, &twin[i], &tm[i], NULL);
+        iv[i] = VK_NULL_HANDLE;
+        mb[1 + i * 2] = mb[2 + i * 2] = 0;
+        {
+            if (!format_ok(V[i].f, MB_DEPTH(V[i].f))) continue;
+            vmaCreateImage(g_vk.vma, &ci, &iai, &img[i], &im[i], NULL);
+            vmaCreateImage(g_vk.vma, &ci, &iai, &twin[i], &tm[i], NULL);
+            VkMemoryRequirements mr;
+            vkGetImageMemoryRequirements(g_vk.dev, img[i], &mr);
+            LOG("[membench] %-24s image: %llu bytes, alignment %llu\n", V[i].name, (unsigned long long)mr.size, (unsigned long long)mr.alignment);
+        }
         VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img[i], .viewType = VK_IMAGE_VIEW_TYPE_2D,
-                                     .format = V[i].f, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+                                     .format = V[i].f, .subresourceRange = {MB_ASPECT(V[i].f), 0, 1, 0, 1}};
         vkCreateImageView(g_vk.dev, &vci, NULL, &iv[i]);
-        uint32_t bpp = V[i].f == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
+        uint32_t bpp = V[i].f == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;  // (depth: its 4 depth bytes)
         mb[1 + i * 2] = mb[2 + i * 2] = (double)V[i].w * V[i].h * bpp / 1048576.0;
     }
     mb[0] = 256;
@@ -1757,18 +1786,22 @@ static void vk_membench(void) {
                                         .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                                         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
                                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                        .image = img[i], .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-            if (img[i]) vkCmdPipelineBarrier2(cb, &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                                        .image = img[i], .subresourceRange = {MB_ASPECT(V[i].f), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+            if (img[i] && twin[i]) vkCmdPipelineBarrier2(cb, &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
                                                                      .pImageMemoryBarriers = &ib});
             ib.image = twin[i];
-            if (twin[i]) vkCmdPipelineBarrier2(cb, &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+            if (img[i] && twin[i]) vkCmdPipelineBarrier2(cb, &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
                                                                       .pImageMemoryBarriers = &ib});
         }
         for (int w = 0; w < 8; w++) vkCmdFillBuffer(cb, bb, 0, sz, (uint32_t)w);
         VkClearColorValue cv = {.float32 = {0.25f, 0.5f, 0.75f, 1}};
         for (int k = 0; k < NT; k++) {
             int i = (k - 1) / 2;
-            if (k && !img[i]) continue;
+            if (k && (!img[i] || !twin[i] || !iv[i])) {  // (not made here: its queries written anyway, all are read at once)
+                vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, qp, (uint32_t)k * 2);
+                vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, qp, (uint32_t)k * 2 + 1);
+                continue;
+            }
             vkCmdPipelineBarrier2(cb, &full);
             vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, qp, (uint32_t)k * 2);
             if (k == 0) vkCmdFillBuffer(cb, bb, 0, sz, 0x3f800000u);
@@ -1778,10 +1811,17 @@ static void vk_membench(void) {
                                                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue.color = cv};
                 VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {V[i].w, V[i].h}}, .layerCount = 1,
                                       .colorAttachmentCount = 1, .pColorAttachments = &ca};
+                if (MB_DEPTH(V[i].f)) {
+                    ca.clearValue.depthStencil = (VkClearDepthStencilValue){1.0f, 0};
+                    ri.colorAttachmentCount = 0;
+                    ri.pColorAttachments = NULL;
+                    ri.pDepthAttachment = &ca;
+                    if (MB_ASPECT(V[i].f) & VK_IMAGE_ASPECT_STENCIL_BIT) ri.pStencilAttachment = &ca;
+                }
                 vkCmdBeginRendering(cb, &ri);
                 vkCmdEndRendering(cb);
             } else {  // (a copy of the whole image into its twin: reads and writes)
-                VkImageCopy ic = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                VkImageCopy ic = {.srcSubresource = {MB_ASPECT(V[i].f), 0, 0, 1}, .dstSubresource = {MB_ASPECT(V[i].f), 0, 0, 1},
                                   .extent = {V[i].w, V[i].h, 1}};
                 vkCmdCopyImage(cb, img[i], VK_IMAGE_LAYOUT_GENERAL, twin[i], VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
             }
@@ -1801,17 +1841,23 @@ static void vk_membench(void) {
     }
     LOG("[membench] fill 256 MB: %.3f ms, %.0f GB/s\n", best[0], 256 / 1024.0 / (best[0] / 1e3));
     for (int i = 0; i < NV; i++) {
+        if (!iv[i]) continue;
         double a = best[1 + i * 2], c = best[2 + i * 2];
         LOG("[membench] %-24s load-op clear %.3f ms %4.0f GB/s, copy %.3f ms %4.0f GB/s (read + write)\n", V[i].name, a,
             mb[1 + i * 2] / 1024.0 / (a / 1e3), c, 2 * mb[2 + i * 2] / 1024.0 / (c / 1e3));
     }
     vkDeviceWaitIdle(g_vk.dev);
-    for (int i = 0; i < NV; i++) if (img[i]) { vkDestroyImageView(g_vk.dev, iv[i], NULL); vmaDestroyImage(g_vk.vma, img[i], im[i]); }
-    for (int i = 0; i < NV; i++) if (twin[i]) vmaDestroyImage(g_vk.vma, twin[i], tm[i]);
+    for (int i = 0; i < NV; i++) {
+        if (iv[i]) vkDestroyImageView(g_vk.dev, iv[i], NULL);
+        if (img[i]) vmaDestroyImage(g_vk.vma, img[i], im[i]);
+        if (twin[i]) vmaDestroyImage(g_vk.vma, twin[i], tm[i]);
+    }
     vmaDestroyBuffer(g_vk.vma, bb, bm);
     vkDestroyFence(g_vk.dev, fence, NULL);
     vkDestroyQueryPool(g_vk.dev, qp, NULL);
     vkDestroyCommandPool(g_vk.dev, pool, NULL);
+#undef MB_DEPTH
+#undef MB_ASPECT
 }
 
 void vk_exec_init(void) {
@@ -2311,8 +2357,11 @@ static void ts_apply(void) {  // (readback_lock held) counters whose submission 
     }
 }
 
-static void readbacks_apply(void) {
-    if (xfer_tl) {  // (xfer_readback) the DMA engine's copies of the submissions done land first, as their own copies did
+// wait: for the DMA engine's copies of the submissions done (a wait for the GPU: what the game reads after it is
+// there). Without (backend_execute: whatever is there by now), one still on its way is applied at a later call.
+static void readbacks_apply(void) { readbacks_apply_(true); }
+static void readbacks_apply_(bool wait) {
+    if (xfer_tl && wait) {  // (xfer_readback) the DMA engine's copies of the submissions done land first, as their own copies did
         uint64_t need = 0, done = vk_completed_seq();
         pthread_mutex_lock(&readback_lock);
         for (int i = 0; i < nreadbacks; i++)
@@ -6109,6 +6158,14 @@ static bool fxaa_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
     if (k == 0) {
+        // A graphics stage's driver constants are its storage buffers' addresses and sizes: the same until one is bound
+        // again (sbuf_gen), within a submission (the span's). Built, compared and copied only then: the 2 KB built and
+        // compared twice a draw was a share of the render thread.
+        uint64_t size = si->cbuf_size[0] > 0x800 ? 0x800 : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
+        static struct { uint64_t gen, seq, size; VkDescriptorBufferInfo bi; } dm[5];
+        uint64_t seq = vk_pending_seq();
+        if (stage >= 0 && stage < 5 && dm[stage].gen == sbuf_gen[stage] && dm[stage].seq == seq && dm[stage].size == size)
+            return dm[stage].bi;
         uint32_t drv[0x800 / 4] = {0};
         if (stage == 5) {
             drv[0x200 / 4] = gx; drv[0x204 / 4] = gy; drv[0x208 / 4] = gz;
@@ -6127,9 +6184,10 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 e[2] = (uint32_t)st.sbuf[stage][i].size;
             }
         }
-        uint64_t size = si->cbuf_size[0] > sizeof drv ? sizeof drv : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
         if (size < 0x500 && stage == 5) size = 0x500;
-        return ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
+        VkDescriptorBufferInfo bi = ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
+        if (stage >= 0 && stage < 5) dm[stage].gen = sbuf_gen[stage], dm[stage].seq = seq, dm[stage].size = size, dm[stage].bi = bi;
+        return bi;
     }
     if (k == 1) {  // compiler constants stored after the shader code
         NvnShaderStage *ss = &st.program->stages[stage];
@@ -6897,6 +6955,8 @@ static int gw_find(uint64_t addr) {  // the first range ending after addr
 // range, until the set changes (gw_gen). The search was 3% of the render thread's time (4 cores, Rito).
 // SAVAGEWIND_VK_NO_GW_MEMO=1: search every time.
 static uint32_t gw_gen = 1;
+static bool gw_overlaps(uint64_t lo, uint64_t hi);
+bool vk_gw_overlaps(uint64_t lo, uint64_t hi) { return gw_overlaps(lo, hi); }
 static bool gw_overlaps(uint64_t lo, uint64_t hi) {
     if (!ngw || hi <= gw_lo || lo >= gw_hi) return false;
     static struct { uint64_t lo, hi; uint32_t gen; bool r; } memo[1024];
@@ -7319,6 +7379,7 @@ static void hc_stale(uint64_t lo, uint64_t hi) {
 static void hc_cpu_wrote(uint64_t addr, uint64_t size) {
     if (hc_ok && addr >= HEAP_BASE && addr < HEAP_BASE + hc_size) hc_stale(addr - HEAP_BASE, addr - HEAP_BASE + size);
 }
+void vk_hc_cpu_wrote(uint64_t addr, uint64_t size) { hc_cpu_wrote(addr, size); }
 
 // (chunks: a word of hc_geo / hc_ok, 64 pages, lies in one chunk)
 static int hc_word_chunk(size_t w) { return (int)(((uint64_t)w * 64 * HC_PAGE) >> hc_shift); }
@@ -12876,6 +12937,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_STORAGE_BUFFERS:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
                 memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
+            if (r->x[0] < 6) sbuf_gen[r->x[0]]++;
             break;
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
@@ -13144,7 +13206,7 @@ static void exec_list(uint64_t handle, int depth) {
 }
 
 void backend_execute(uint64_t handle) {
-    readbacks_apply();
+    readbacks_apply_(false);  // (no wait for a read back's DMA copy here: only waits for the GPU need it)
     ubo_check_done(false);  // (SAVAGEWIND_VK_UBO_CHECK: as soon after each submission is done as the lists come)
     SW_ZONE("backend_execute");
     { SW_ACC("exec_lock"); gpu_lock(); }

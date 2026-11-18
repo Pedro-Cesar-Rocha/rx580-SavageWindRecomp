@@ -60,18 +60,31 @@ static int g_mode = -1;  // 1: the futex words, 0: the pthread members
 static int g_mtries = 64;
 static uint64_t g_spin_ns;
 
+// The wait's spin by the processors the process runs on now (SAVAGEWIND_KSYNC_SPIN set: also with fewer than 6), under
+// a lock of its own, so a late setup can't store what it counted before ksync_cpus_changed.
+static void spin_update(void) {
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&m);
+    const char *sp = getenv("SAVAGEWIND_KSYNC_SPIN");
+    long us = sp ? atol(sp) : 20;
+    int cpus = plat_cpu_count();
+    __atomic_store_n(&g_spin_ns, (!sp && cpus < 6) || us < 0 ? 0 : (uint64_t)us * 1000, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&m);
+}
 static void ksync_setup(void) {
     int mode = 1;
     const char *e = getenv("SAVAGEWIND_KSYNC");
     if (e && !strcmp(e, "0")) mode = 0;
     if (mode && !park_init()) mode = 0;
     if (getenv("SAVAGEWIND_KLOCK_SPIN")) g_mtries = atoi(getenv("SAVAGEWIND_KLOCK_SPIN"));
-    long us = 20;
-    if (getenv("SAVAGEWIND_KSYNC_SPIN")) us = atol(getenv("SAVAGEWIND_KSYNC_SPIN"));
-    int cpus = plat_cpu_count();
-    g_spin_ns = cpus < 6 || us < 0 ? 0 : (uint64_t)us * 1000;
+    spin_update();
     __atomic_store_n(&g_mode, mode, __ATOMIC_RELEASE);
 }
+// The game's processors are set (plat_cpu_placement: one per core) once host threads may have set ksync up already: a
+// host thread that took g_klock at its start (the renderer's) counted every logical processor, and on 4 cores with SMT
+// every wait of every guest thread then spun 20 us before it slept - the game's idle job workers each burned 2-3 times
+// their CPU time, 1-2 ms a frame in all, on processors the game's busy threads were short of.
+void ksync_cpus_changed(void) { spin_update(); }
 static inline int mode(void) {
     int m = __atomic_load_n(&g_mode, __ATOMIC_ACQUIRE);
     if (__builtin_expect(m < 0, 0)) {

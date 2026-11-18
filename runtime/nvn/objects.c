@@ -226,7 +226,7 @@ static void *queue_thread(void *arg) {
     (void)arg;
     prof_thread_name("nvn-queue");
     plat_thread_elevate();
-    kernel_sample_host_thread();
+    kernel_sample_host_thread_at(0);
     extern void control_prof_thread(const char *name);  // runtime/control_prof.c (`threads`)
     control_prof_thread("render");
     pthread_mutex_lock(&g_q_lock);
@@ -659,9 +659,17 @@ static void texture_key(const NvnTexture *t, TexKey *k) {
     memcpy(k->swizzle, t->swizzle, 4);
     k->stride = t->stride, k->addr = t->addr, k->pool_offset = t->pool_offset, k->pool = t->pool;
 }
-static uint32_t key_slot(const TexKey *k) {
+static uint32_t key_slot(const TexKey *k) {  // (8 bytes a step: byte by byte, a key took ~200 dependent multiplies)
     uint64_t h = 0xcbf29ce484222325ull;
-    for (size_t i = 0; i < sizeof *k; i++) h = (h ^ ((const uint8_t *)k)[i]) * 0x100000001b3ull;
+    const uint8_t *b = (const uint8_t *)k;
+    size_t i = 0;
+    for (; i + 8 <= sizeof *k; i += 8) {
+        uint64_t w;
+        memcpy(&w, b + i, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    for (; i < sizeof *k; i++) h = (h ^ b[i]) * 0x100000001b3ull;
     return (uint32_t)(h >> 32) & (g_key_cap - 1);
 }
 static void key_put(NvnTexture *t) {  // (lock held)

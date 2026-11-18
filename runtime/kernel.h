@@ -81,6 +81,7 @@ void kernel_host_work_end(void);
 // and entry points; returns how many
 int kernel_running_threads(pthread_t *host, uint32_t *handle, uint64_t *entry, int max);
 void kernel_sample_host_thread(void);  // (profiling) the calling host thread is sampled too (handle 0xf000 + n)
+void kernel_sample_host_thread_at(int i);  // ... as handle 0xf000 + i (0: the NVN queue thread, 1: the recorder)
 // A better thread waits for t's core: t lets it have it (dispatch.c, at indirect calls; g_core_best_wait: per core)
 typedef struct { volatile int v; char pad[60]; } __attribute__((aligned(64))) CoreBestWait;  // (one cache line per core)
 extern CoreBestWait g_core_best_wait[4];

@@ -108,6 +108,40 @@ void *hle_alloc(uint64_t size) {
     return (void *)a;
 }
 
+// Every module's functions by address in one open-addressing table: a lookup the per-thread cache misses costs a
+// probe or two, where the binary search through ~125,000 addresses took ~17 steps, most of them cache misses (with
+// dispatch_slow, ~20% of the dispatching time of the game's threads in Kakariko). An entry is the address's low 32 bits
+// (the modules span far less than 4 GB, so they tell the functions apart in [ftab_lo, ftab_hi]) and the function's
+// place in its module's table (module in the top 4 bits).
+static struct { uint32_t lo, at; } *ftab;
+static uint64_t ftab_mask, ftab_lo, ftab_hi;
+static void ftab_build(void) {
+    uint64_t total = 0;
+    ftab_lo = ~0ull, ftab_hi = 0;
+    for (int t = 0; t < ntables; t++) {
+        total += tables[t].count;
+        if (tables[t].lo < ftab_lo) ftab_lo = tables[t].lo;
+        if (tables[t].hi > ftab_hi) ftab_hi = tables[t].hi;
+    }
+    free(ftab);
+    ftab = NULL;
+    if (!total || ftab_hi - ftab_lo >= (1ull << 32) || ntables > 16) return;  // (the binary search, as before)
+    uint64_t cap = 1;
+    while (cap < total * 2) cap <<= 1;
+    ftab = calloc(cap, sizeof *ftab);
+    if (!ftab) return;
+    ftab_mask = cap - 1;
+    for (int t = 0; t < ntables; t++)
+        for (uint64_t i = 0; i < tables[t].count; i++) {
+            uint64_t a = tables[t].addrs[i];
+            if ((uint32_t)a == 0 || i >= (1u << 28)) { free(ftab); ftab = NULL; return; }
+            uint64_t h = ((a >> 2) * 0x9E3779B97F4A7C15ull) >> 20 & ftab_mask;
+            while (ftab[h].lo) h = (h + 1) & ftab_mask;
+            ftab[h].lo = (uint32_t)a;
+            ftab[h].at = (uint32_t)t << 28 | (uint32_t)i;
+        }
+}
+
 void dispatch_init(void) {  // (after gamelib_load)
     const GameLibTables *g = gamelib_tables();
     ntables = 0;
@@ -116,9 +150,20 @@ void dispatch_init(void) {  // (after gamelib_load)
         uint64_t n = *m->count;
         if (n) tables[ntables++] = (FnTable){m->addrs, m->fns, n, m->addrs[0], m->addrs[n - 1]};
     }
+    ftab_build();
 }
 
 GuestFn dispatch_lookup(uint64_t addr) {
+    if (ftab) {
+        if (addr < ftab_lo || addr > ftab_hi || !(uint32_t)addr) return NULL;
+        for (uint64_t h = ((addr >> 2) * 0x9E3779B97F4A7C15ull) >> 20 & ftab_mask; ftab[h].lo; h = (h + 1) & ftab_mask)
+            if (ftab[h].lo == (uint32_t)addr) {
+                const FnTable *ft = &tables[ftab[h].at >> 28];
+                uint32_t i = ftab[h].at & 0x0FFFFFFF;
+                if (ft->addrs[i] == addr) return ft->fns[i];
+            }
+        return NULL;
+    }
     for (int t = 0; t < ntables; t++) {
         FnTable *ft = &tables[t];
         if (addr < ft->lo || addr > ft->hi) continue;
@@ -133,9 +178,11 @@ GuestFn dispatch_lookup(uint64_t addr) {
     return NULL;
 }
 
-// Small direct-mapped cache in front of the binary search
+// Each thread's cache in front of the table: 4096 sets of two (the latest in the first), one 32-byte pair per set.
+// One way of 4096 conflicted: thousands of virtual call targets a frame in the open world.
 #define DCACHE 4096
-static __thread struct { uint64_t addr; GuestFn fn; } dcache[DCACHE];
+typedef struct { uint64_t addr; GuestFn fn; } DEnt;
+static __thread DEnt dcache[DCACHE][2] __attribute__((aligned(32)));
 
 static GuestFn dispatch_slow(Cpu *c) {
     uint64_t pc = c->pc;
@@ -157,18 +204,52 @@ static GuestFn dispatch_slow(Cpu *c) {
         FATAL("no function at %llx (lr=%llx %s+%llx)\n", pc, c->x[30], s ? s : "?", off);
     }
     unsigned h = (unsigned)(pc >> 2) & (DCACHE - 1);
-    dcache[h].addr = pc;
-    dcache[h].fn = f;
+    dcache[h][1] = dcache[h][0];
+    dcache[h][0] = (DEnt){pc, f};
     return f;
+}
+
+// The rare ways on, each a function of its own: rt_dispatch's usual way (the cache's answer) then calls nothing, so it
+// has no frame to set up and take down (with them inlined it saved and restored five registers and moved the stack
+// on every indirect call the game makes: rt_dispatch was ~5% of the game threads' time in Kakariko).
+__attribute__((noinline, cold)) static void dispatch_miss(Cpu *c) {
+    GuestFn f = dispatch_slow(c);
+    __attribute__((musttail)) return f(c);
+}
+__attribute__((noinline, cold)) static void dispatch_preempt(Cpu *c) {
+    kernel_preempt(c->thread);
+    unsigned h = (unsigned)(c->pc >> 2) & (DCACHE - 1);
+    GuestFn f = dcache[h][0].addr == c->pc ? dcache[h][0].fn : dcache[h][1].addr == c->pc ? dcache[h][1].fn : dispatch_slow(c);
+    __attribute__((musttail)) return f(c);
 }
 
 // Always tail-calls, so chains of indirect jumps don't grow the host stack.
 void rt_dispatch(Cpu *c) {
     KThread *t = c->thread;  // (a better thread waiting for this one's core gets it: kernel.c kernel_preempt)
-    if (t && t->core_held >= 0 && __builtin_expect(g_core_best_wait[t->core_held].v < t->prio, 0)) kernel_preempt(t);
-    unsigned h = (unsigned)(c->pc >> 2) & (DCACHE - 1);
-    GuestFn f = dcache[h].addr == c->pc ? dcache[h].fn : dispatch_slow(c);
-    __attribute__((musttail)) return f(c);
+    uint64_t pc = c->pc;
+    // An HLE function (NVN, the SDK's): never in the cache, as each call is a reboot's safe point - taken here without a
+    // call (a stop, or a better thread waiting for the core, goes the slow way). ~50,000 a frame in the open world, most
+    // from the threads recording NVN command buffers.
+    if (pc - HLE_BASE < HLE_SIZE && !__builtin_expect(g_rt_unwind, 0)) {
+        uint64_t i = (pc - HLE_BASE) / 16;
+        if (i < (uint64_t)hle_count && hle_slots[i].fn && !(t && t->core_held >= 0 && g_core_best_wait[t->core_held].v < t->prio)) {
+            GuestFn f = hle_slots[i].fn;
+            __attribute__((musttail)) return f(c);
+        }
+    }
+    if (t && t->core_held >= 0 && __builtin_expect(g_core_best_wait[t->core_held].v < t->prio, 0))
+        __attribute__((musttail)) return dispatch_preempt(c);
+    unsigned h = (unsigned)(pc >> 2) & (DCACHE - 1);
+    const DEnt *e = dcache[h];
+    if (__builtin_expect(e[0].addr == pc, 1)) {
+        GuestFn f = e[0].fn;
+        __attribute__((musttail)) return f(c);
+    }
+    if (e[1].addr == pc) {
+        GuestFn f = e[1].fn;
+        __attribute__((musttail)) return f(c);
+    }
+    __attribute__((musttail)) return dispatch_miss(c);
 }
 
 void guest_call(Cpu *c, uint64_t addr) {

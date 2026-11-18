@@ -174,6 +174,7 @@ static void boot(const char *root) {
     { extern void settings_load(void); settings_load(); }
     { extern void language_booted(void); language_booted(); }  // (runtime/language.c)
     plat_cpu_placement();
+    ksync_cpus_changed();  // (ksync.h: the waits' spin, by these processors)
     kernel_init();
     dispatch_init();
     { extern void rupees_start(void); rupees_start(); }  // (Cheats > Infinite rupees, `rupees`: runtime/rupees.c)

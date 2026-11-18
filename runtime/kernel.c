@@ -378,12 +378,21 @@ void kernel_sample_host_thread(void) {
     if (g_nhost_threads < 4) g_host_threads[g_nhost_threads++] = pthread_self();
     kunlock();
 }
+void kernel_sample_host_thread_at(int i) {  // (a fixed handle, 0xf000 + i, whichever thread starts first)
+    klock();
+    if (i >= 0 && i < 4) {
+        g_host_threads[i] = pthread_self();
+        if (g_nhost_threads <= i) g_nhost_threads = i + 1;
+    }
+    kunlock();
+}
 int kernel_running_threads(pthread_t *host, uint32_t *handle, uint64_t *entry, int max) {
     int n = 0;
     klock();
     for (KThread *t = g_threads; t && n < max; t = t->anext)
         if (t->started && !t->finished) host[n] = t->host, handle[n] = t->handle, entry[n] = t->entry, n++;
-    for (int i = 0; i < g_nhost_threads && n < max; i++) host[n] = g_host_threads[i], handle[n] = 0xf000 + i, entry[n] = 0, n++;
+    for (int i = 0; i < g_nhost_threads && n < max; i++)
+        if (g_host_threads[i]) host[n] = g_host_threads[i], handle[n] = 0xf000 + i, entry[n] = 0, n++;
     kunlock();
     return n;
 }

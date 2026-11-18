@@ -113,8 +113,14 @@ static void publish(void) {
 static void slow_wait(const char *what, uint64_t ns);
 // T: room for `need` bytes at wpos (the recorder frees room as it records; a full ring means it is behind by its
 // whole size, 16 MB of packets, so the wait is rare)
+static uint64_t tail_seen;  // (T) tail as T last read it: never ahead of R's, so room it shows is there
 static void wait_room(uint64_t need) {
-    if (wpos + need - atomic_load_explicit(&tail, memory_order_acquire) <= ring_cap) return;
+    // (the shared tail only when the ring looks full by T's own copy: R writes tail after every packet, and T reading it
+    // before every packet moved its cache line between the two cores ~16,000 times a frame - with a 16 MB ring, T
+    // now reads it about once per 16 MB of packets)
+    if (wpos + need - tail_seen <= ring_cap) return;
+    tail_seen = atomic_load_explicit(&tail, memory_order_acquire);
+    if (wpos + need - tail_seen <= ring_cap) return;
     publish();
     SW_ZONE("recorder ring full");
     uint64_t t0 = NOW();
@@ -186,6 +192,8 @@ static void *run(void *arg) {
     is_recorder = true;
     prof_thread_name("vk-record");
     plat_thread_elevate();
+    extern void kernel_sample_host_thread_at(int i);  // (runtime/kernel.h: sampled as 0xf001)
+    kernel_sample_host_thread_at(1);
     extern void control_prof_thread(const char *name);  // runtime/control_prof.c (`threads`)
     control_prof_thread("recorder");
     uint64_t t = 0;
@@ -328,6 +336,20 @@ void rec_stats_take(RecStats *o) {
 #define ENQ_END() do { if (prof_enq) st_t.enqueue_ns += NOW() - enq_t0_; } while (0)
 
 // ================================================================== descriptor writes
+typedef struct { VkDescriptorSet set; VkDescriptorUpdateTemplate t; uint32_t n; } TmplArgs;  // then n * 24 bytes
+static void update_tmpl_run(const void *p) {
+    const TmplArgs *a = p;
+    vkUpdateDescriptorSetWithTemplate(g_vk.dev, a->set, a->t, (const uint8_t *)p + AL16(sizeof *a));
+}
+void rec_UpdateDescriptorSetTemplate(VkDescriptorSet set, VkDescriptorUpdateTemplate t, uint32_t n, const void *data) {
+    if (on <= 0) { vkUpdateDescriptorSetWithTemplate(g_vk.dev, set, t, data); return; }
+    ENQ_T0();
+    TmplArgs *a = push(update_tmpl_run, sizeof *a, (size_t)n * 24);
+    *a = (TmplArgs){set, t, n};
+    memcpy(after(a, sizeof *a), data, (size_t)n * 24);
+    commit();
+    ENQ_END();
+}
 static bool write_is_image(const VkWriteDescriptorSet *w) {
     switch (w->descriptorType) {
     case VK_DESCRIPTOR_TYPE_SAMPLER: case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:

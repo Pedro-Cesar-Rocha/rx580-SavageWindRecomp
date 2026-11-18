@@ -2127,13 +2127,29 @@ static int pass_nlinear;
 // again (the CPU fills BOTW's height tiles in memory it also has the GPU draw into; copying the whole image back over
 // them lost those writes). So does another image: a texture made again at the same memory gets a new one once the old
 // one was let go, and it holds nothing yet.
-static struct { uint64_t addr, size, hash, serial; int pending; } linear_mem[64];
+// ww: the write watch (platform.h plat_written_since) reset over the memory when hash was taken (ww_epoch: the reset's
+// number): not written since, the memory still has that hash - no need to read 1 MB again at every pass into BOTW's
+// 512x512 map (~5% of the render thread on the Great Plateau). SAVAGEWIND_VK_LINEAR_WW=0: always hashed.
+static struct { uint64_t addr, size, hash, serial; int pending; uint32_t ww_epoch; bool ww; } linear_mem[64];
 static int nlinear_mem;
 static int linear_mem_find(uint64_t addr, uint64_t size) {  // (readback_lock held)
     for (int i = 0; i < nlinear_mem; i++) if (linear_mem[i].addr == addr && linear_mem[i].size == size) return i;
     if (nlinear_mem == 64) return -1;
-    linear_mem[nlinear_mem] = (typeof(linear_mem[0])){addr, size, 0, 0, 0};
+    linear_mem[nlinear_mem] = (typeof(linear_mem[0])){addr, size, 0, 0, 0, 0, false};
     return nlinear_mem++;
+}
+static void linear_mem_watch(int i) {  // (readback_lock held) its hash was just taken from the memory as it is now
+    static int on = -1;
+    if (on < 0) on = !getenv("SAVAGEWIND_VK_LINEAR_WW") || atoi(getenv("SAVAGEWIND_VK_LINEAR_WW"));
+    linear_mem[i].ww = false;
+    if (!on) return;
+    uint64_t lo = linear_mem[i].addr & ~0xFFFull, hi = (linear_mem[i].addr + linear_mem[i].size + 0xFFF) & ~0xFFFull, pages[512];
+    long n = plat_written_pages(lo, hi - lo, pages, 512);
+    if (n < 0 && plat_written_since(lo, hi - lo, 0) < 0) return;  // (not watched here)
+    if (n < 0) hc_cpu_wrote(lo, hi - lo);  // (the heap copy: the pages this reset found written, as its own query would)
+    for (long k = 0; k < n; k++) hc_cpu_wrote(pages[k], 0x1000);
+    linear_mem[i].ww_epoch = plat_written_epoch();
+    linear_mem[i].ww = true;
 }
 extern void vk_texture_reload(NvnTexture *t);
 extern uint64_t vk_hash_bytes(const void *p, uint64_t n);
@@ -2156,10 +2172,12 @@ static void linear_target_sync(NvnTexture *t) {
     int n = nlinear_mem, i = linear_mem_find(t->addr, size);
     bool reload = false;
     if (i >= 0 && !linear_mem[i].pending) {  // (a copy back still in flight: the memory is the GPU's until it lands)
-        uint64_t h = vk_hash_bytes((const void *)(uintptr_t)t->addr, size);
+        bool same = i < n && linear_mem[i].ww && plat_written_since(t->addr, size, linear_mem[i].ww_epoch) == 0;
+        uint64_t h = same ? linear_mem[i].hash : vk_hash_bytes((const void *)(uintptr_t)t->addr, size);
         reload = i >= n || h != linear_mem[i].hash || serial != linear_mem[i].serial;  // (first use: whatever the CPU put there)
         linear_mem[i].hash = h;
         linear_mem[i].serial = serial;
+        if (!same) linear_mem_watch(i);
     }
     pthread_mutex_unlock(&readback_lock);
     if (reload) vk_texture_reload(t), stat_lin_reload++;
@@ -2432,6 +2450,7 @@ static void readbacks_apply_(bool wait) {
                 if (linear_mem[m].pending > 0) linear_mem[m].pending--;
                 linear_mem[m].hash = vk_hash_bytes((const void *)(uintptr_t)r->addr, r->stride * r->rows);
                 linear_mem[m].serial = r->serial;
+                linear_mem_watch(m);  // (the copy back just written there: its own write is not the CPU's change)
             }
         }
         nreadbacks = k;
@@ -4433,6 +4452,25 @@ static uint64_t hash_words(uint64_t h, const void *p, size_t n) {
     for (; n >= 8; n -= 8, b += 8) { uint64_t w; memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
     for (; n; n--, b++) { h = (h ^ *b) * 0x100000001B3ull; }
     return h ^ (h >> 32);
+}
+
+// hash_words in four lanes of 8 bytes (32 bytes a step, the lanes independent): for the per-draw and per-wait hashes
+// of in-memory tables (pipeline keys, view memo, the vertex data samples), where hash_words' one chain of multiplies was
+// ~4% of the render thread and ~2% of the game's main thread. Never for a value kept between runs (the pipeline lists
+// use hash_words).
+static uint64_t hash_lanes(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = p;
+    uint64_t a0 = h, a1 = h ^ 0x243F6A8885A308D3ull, a2 = h ^ 0x13198A2E03707344ull, a3 = h ^ 0xA4093822299F31D0ull;
+    for (; n >= 32; n -= 32, b += 32) {
+        uint64_t w[4];
+        memcpy(w, b, 32);
+        a0 = (a0 ^ w[0]) * 0x9E3779B97F4A7C15ull; a0 ^= a0 >> 29;
+        a1 = (a1 ^ w[1]) * 0x9E3779B97F4A7C15ull; a1 ^= a1 >> 29;
+        a2 = (a2 ^ w[2]) * 0x9E3779B97F4A7C15ull; a2 ^= a2 >> 29;
+        a3 = (a3 ^ w[3]) * 0x9E3779B97F4A7C15ull; a3 ^= a3 >> 29;
+    }
+    h = ((a0 * 0xFF51AFD7ED558CCDull ^ a1) * 0xC4CEB9FE1A85EC53ull ^ a2) * 0x9E3779B97F4A7C15ull ^ a3;
+    return hash_words(h, b, n);  // (the last 0-31 bytes)
 }
 
 static uint64_t hmix(uint64_t h, const void *p, size_t n) {
@@ -7664,7 +7702,7 @@ static bool vdyn_fetch(uint64_t addr, uint64_t size) {
     if (w - atomic_load_explicit(&vdyn_r, memory_order_acquire) >= VDYN_N) return true;  // (full: no sample)
     __typeof__(vdyn_chk[0]) *c = &vdyn_chk[w % VDYN_N];
     c->addr = addr, c->size = size, c->seq = vk_pending_seq();
-    c->hash = hash_words(0x9E3779B97F4A7C15ull, (const void *)(uintptr_t)addr, size & ~3ull);
+    c->hash = hash_lanes(0x9E3779B97F4A7C15ull, (const void *)(uintptr_t)addr, size & ~3ull);
     atomic_store_explicit(&vdyn_w, w + 1, memory_order_release);
     return true;
 }
@@ -7676,7 +7714,7 @@ static void vdyn_check(uint64_t seq) {
     uint64_t r = atomic_load_explicit(&vdyn_r, memory_order_relaxed), w = atomic_load_explicit(&vdyn_w, memory_order_acquire);
     for (; r < w && vdyn_chk[r % VDYN_N].seq <= seq; r++) {
         __typeof__(vdyn_chk[0]) *c = &vdyn_chk[r % VDYN_N];
-        if (hash_words(0x9E3779B97F4A7C15ull, (const void *)(uintptr_t)c->addr, c->size & ~3ull) == c->hash) continue;
+        if (hash_lanes(0x9E3779B97F4A7C15ull, (const void *)(uintptr_t)c->addr, c->size & ~3ull) == c->hash) continue;
         uint64_t reg = (c->addr - HEAP_BASE) >> VDYN_SHIFT, frame = renderer_present_count();
         if (framepace_loading_ui() || frame == vdyn_last[reg]) continue;
         vdyn_hits[reg] = frame - vdyn_last[reg] <= 60 && vdyn_hits[reg] < 255 ? vdyn_hits[reg] + 1 : 1;
@@ -7987,7 +8025,7 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
             static int nomemo = -1;
             if (nomemo < 0) nomemo = getenv("SAVAGEWIND_VK_NO_TEX_MEMO") != NULL;
             static struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view; VkImageView view; } memo[1024];
-            uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
+            uint64_t vh = e->has_view ? hash_lanes(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
             uint32_t ms = (uint32_t)((((uintptr_t)et >> 4) ^ vh ^ (uint64_t)st_->type * 0x9E3779B97F4A7C15ull) & 1023);
             if (!nomemo && memo[ms].tex == et && memo[ms].vh == vh && memo[ms].frame == frame && memo[ms].gen == vk_view_gen &&
                 memo[ms].type == st_->type && memo[ms].has_view == e->has_view) {
@@ -8057,6 +8095,42 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
     *out = (VkDescriptorImageInfo){smp, view, layout};
 }
 
+// A new set's descriptors go to the driver through an update template made for its layout and the bindings written
+// (in w's order: the same for every draw of a program), one entry of 24 bytes each - not as n VkWriteDescriptorSet the
+// recorder copies and the driver reads one by one (~1000 new sets a frame in the open world). The templates last as
+// long as their layouts (they are never made again). SAVAGEWIND_VK_SET_TEMPLATES=0: writes, as before.
+#define TMPL_TAB 1024
+static struct { VkDescriptorSetLayout layout; uint64_t sig; int n; VkDescriptorUpdateTemplate t; } tmpl_tab[TMPL_TAB];
+static VkDescriptorUpdateTemplate set_template(VkDescriptorSetLayout layout, const VkWriteDescriptorSet *w, int n) {
+    static int on = -1;
+    if (on < 0) on = !getenv("SAVAGEWIND_VK_SET_TEMPLATES") || atoi(getenv("SAVAGEWIND_VK_SET_TEMPLATES"));
+    if (!on || n > MAX_BIND) return VK_NULL_HANDLE;
+    uint64_t sig = 0xcbf29ce484222325ull;
+    for (int i = 0; i < n; i++) {
+        if (w[i].descriptorCount != 1 || w[i].pNext || w[i].pTexelBufferView || (!w[i].pImageInfo && !w[i].pBufferInfo))
+            return VK_NULL_HANDLE;
+        sig = (sig ^ (w[i].dstBinding | (uint64_t)w[i].descriptorType << 32)) * 0x100000001B3ull;
+    }
+    uint32_t h = (uint32_t)((((uintptr_t)layout >> 4) * 0x9E3779B97F4A7C15ull ^ sig) >> 40) & (TMPL_TAB - 1);
+    for (int probe = 0; probe < 8; probe++, h = (h + 1) & (TMPL_TAB - 1)) {
+        if (tmpl_tab[h].layout == layout && tmpl_tab[h].sig == sig && tmpl_tab[h].n == n) return tmpl_tab[h].t;
+        if (tmpl_tab[h].layout) continue;
+        VkDescriptorUpdateTemplateEntry e[MAX_BIND];
+        for (int i = 0; i < n; i++)
+            e[i] = (VkDescriptorUpdateTemplateEntry){.dstBinding = w[i].dstBinding, .descriptorCount = 1,
+                                                     .descriptorType = w[i].descriptorType, .offset = (size_t)i * 24, .stride = 24};
+        VkDescriptorUpdateTemplateCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
+                                                   .descriptorUpdateEntryCount = (uint32_t)n, .pDescriptorUpdateEntries = e,
+                                                   .templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET,
+                                                   .descriptorSetLayout = layout};
+        VkDescriptorUpdateTemplate t;
+        if (vkCreateDescriptorUpdateTemplate(g_vk.dev, &ci, NULL, &t) != VK_SUCCESS) return VK_NULL_HANDLE;
+        tmpl_tab[h].layout = layout; tmpl_tab[h].sig = sig; tmpl_tab[h].n = n; tmpl_tab[h].t = t;
+        return t;
+    }
+    return VK_NULL_HANDLE;  // (the table's neighbourhood full: writes)
+}
+
 // Descriptor sets of identical contents within one submission are one set (the open world draws many objects with
 // the same material textures and constants): saves the allocation and the update. SAVAGEWIND_VK_NO_SET_CACHE=1: off.
 // Entries are told apart by two independent 64-bit hashes of the contents (no stored key: comparing ~700-byte keys
@@ -8072,8 +8146,12 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
     SetEnt *e = NULL;
     uint64_t seq = vk_pending_seq() + (setc_gen << 40), h = 0, h2 = 0;
     if (!off) {
-        h = (uint64_t)(uintptr_t)layout;
-        h2 = h ^ 0x6A09E667F3BCC909ull;
+        // (each of the four words of an entry in a lane of its own, for both hashes: eight independent chains, where
+        // one chain of 4n multiplies a hash was ~6% of the render thread on the Great Plateau)
+        uint64_t l0 = (uint64_t)(uintptr_t)layout, a[4] = {l0, l0 ^ 0x243F6A8885A308D3ull, l0 ^ 0x13198A2E03707344ull,
+                                                            l0 ^ 0xA4093822299F31D0ull};
+        uint64_t b[4] = {l0 ^ 0x6A09E667F3BCC909ull, l0 ^ 0xBB67AE8584CAA73Bull, l0 ^ 0x3C6EF372FE94F82Bull,
+                         l0 ^ 0xA54FF53A5F1D36F1ull};
         for (int i = 0; i < n; i++) {
             uint64_t v[4];
             v[0] = w[i].dstBinding | (uint64_t)w[i].descriptorType << 32;
@@ -8087,10 +8165,14 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
                 v[3] = w[i].pBufferInfo->range;
             }
             for (int k = 0; k < 4; k++) {
-                h = (h ^ v[k]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29;
-                h2 = (h2 ^ v[k]) * 0xC2B2AE3D27D4EB4Full; h2 ^= h2 >> 31;
+                a[k] = (a[k] ^ v[k]) * 0x9E3779B97F4A7C15ull; a[k] ^= a[k] >> 29;
+                b[k] = (b[k] ^ v[k]) * 0xC2B2AE3D27D4EB4Full; b[k] ^= b[k] >> 31;
             }
         }
+        h = (((a[0] * 0xFF51AFD7ED558CCDull) ^ a[1]) * 0xC4CEB9FE1A85EC53ull ^ a[2]) * 0x9E3779B97F4A7C15ull ^ a[3];
+        h2 = (((b[0] * 0xC4CEB9FE1A85EC53ull) ^ b[1]) * 0xFF51AFD7ED558CCDull ^ b[2]) * 0xC2B2AE3D27D4EB4Full ^ b[3];
+        h ^= h >> 29;
+        h2 ^= h2 >> 31;
         h ^= h >> 32;
         if (!setc) setc = calloc(SETC_TAB, sizeof *setc);
         e = &setc[(h ^ (h >> 31)) & (SETC_TAB - 1)];
@@ -8100,8 +8182,17 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
         }
     }
     VkDescriptorSet ds = vk_alloc_set(layout);
-    for (int i = 0; i < n; i++) w[i].dstSet = ds;
-    if (n) rec_UpdateDescriptorSets((uint32_t)n, w);
+    VkDescriptorUpdateTemplate tp = n ? set_template(layout, w, n) : VK_NULL_HANDLE;
+    if (tp) {  // (the descriptors packed as the template reads them: 24 bytes each, in w's order)
+        uint8_t data[MAX_BIND * 24];
+        for (int i = 0; i < n; i++)
+            if (w[i].pImageInfo) memcpy(data + i * 24, w[i].pImageInfo, 24);
+            else memcpy(data + i * 24, w[i].pBufferInfo, 24);
+        rec_UpdateDescriptorSetTemplate(ds, tp, (uint32_t)n, data);
+    } else {
+        for (int i = 0; i < n; i++) w[i].dstSet = ds;
+        if (n) rec_UpdateDescriptorSets((uint32_t)n, w);
+    }
     if (e) {
         e->seq = vk_pending_seq() + (setc_gen << 40);  // (the set lives in this submission's pools)
         e->hash = h; e->hash2 = h2; e->layout = layout; e->set = ds; e->n = (uint32_t)n;
@@ -9888,7 +9979,7 @@ static void draw_(CmdRec *r, bool indexed) {
     k.s.poly_fill = st.poly[2] != 1;
     pp = pipe_memo.pp;
     if (!pp || memcmp(&pipe_memo.k, &k, sizeof k)) {
-        uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
+        uint64_t ph = hash_lanes(0xcbf29ce484222325ull, &k, sizeof k);
         if (!ph) ph = 1;
         if (!pipe_tab) pipe_tab_grow();
         uint32_t pslot = pipe_slot_of(ph, pipe_cap);
@@ -10246,9 +10337,24 @@ have_pipe:
             if (base_vertex > 0) max_index += (uint32_t)base_vertex;
         }
     }
-    if (use_index && (dc.ibuf != ib.buf || dc.ioff != ib.off || dc.itype != (uint32_t)itype_vk)) {
-        rec_CmdBindIndexBuffer(cb, ib.buf, ib.off, itype_vk);
-        dc.ibuf = ib.buf; dc.ioff = ib.off; dc.itype = itype_vk;
+    // The indices' buffer bound from its start where the first index can reach them: the next draws with indices in
+    // the same buffer (most of the game's meshes keep theirs in a few guest buffers, the copies go to one transient
+    // buffer) say where theirs begin with the draw's first index instead of a bind of their own - a bind per draw was
+    // a driver call for ~3000 of the ~3600 draws of a frame in Kakariko. SAVAGEWIND_VK_INDEX_REBIND=1: a bind per offset.
+    uint32_t first_index = 0;
+    if (use_index) {
+        static int rebind = -1;
+        if (rebind < 0) rebind = getenv("SAVAGEWIND_VK_INDEX_REBIND") != NULL;
+        uint64_t isz = itype_vk == VK_INDEX_TYPE_UINT16 ? 2 : 4, d = ib.off - dc.ioff;
+        if (!rebind && dc.ibuf == ib.buf && dc.itype == (uint32_t)itype_vk && ib.off >= dc.ioff && d % isz == 0 &&
+            d / isz + icount <= UINT32_MAX) {
+            first_index = (uint32_t)(d / isz);
+        } else {
+            VkDeviceSize at = !rebind && ib.off % isz == 0 && ib.off / isz + icount <= UINT32_MAX ? 0 : ib.off;
+            rec_CmdBindIndexBuffer(cb, ib.buf, at, itype_vk);
+            dc.ibuf = ib.buf; dc.ioff = at; dc.itype = itype_vk;
+            first_index = (uint32_t)((ib.off - at) / isz);
+        }
     }
     if (profd) {
         uint64_t now = SDL_GetTicksNS();
@@ -10256,7 +10362,19 @@ have_pipe:
         prof_index_start = now;
     }
 
-    // ---- vertex streams: the range this draw can read, copied once per submission
+    // ---- vertex streams: the range this draw can read, copied once per submission. The streams that changed are bound
+    // a run of consecutive ones a call (a mesh's streams change together: one driver call, where there was one each).
+    VkBuffer vb_b[17];
+    VkDeviceSize vb_o[17];
+    uint32_t vb_first = 0, vb_n = 0;
+#define VB_BIND(s_, b_, o_) do {                                                                          \
+        if (vb_n && (uint32_t)(s_) != vb_first + vb_n) {                                                  \
+            rec_CmdBindVertexBuffers(cb, vb_first, vb_n, vb_b, vb_o);                                     \
+            vb_n = 0;                                                                                     \
+        }                                                                                                 \
+        if (!vb_n) vb_first = (uint32_t)(s_);                                                             \
+        vb_b[vb_n] = (b_), vb_o[vb_n] = (o_), vb_n++;                                                     \
+    } while (0)
     for (uint32_t sm = pipe_memo.k.s.used_streams & ((1u << 17) - 1); sm; sm &= sm - 1) {
         int s = __builtin_ctz(sm);
         VkSpan sp;
@@ -10271,7 +10389,7 @@ have_pipe:
                 if (profd) prof_vertex_direct++;
                 race_probe_note(v.addr, v.size, false);
                 if (dc.vbuf[s] != dbuf || dc.voff[s] != doff) {
-                    rec_CmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
+                    VB_BIND(s, dbuf, doff);
                     dc.vbuf[s] = dbuf; dc.voff[s] = doff;
                 }
                 continue;
@@ -10296,10 +10414,12 @@ have_pipe:
         }
         VkDeviceSize off = sp.off;
         if (dc.vbuf[s] != sp.buf || dc.voff[s] != off) {
-            rec_CmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &off);
+            VB_BIND(s, sp.buf, off);
             dc.vbuf[s] = sp.buf; dc.voff[s] = off;
         }
     }
+    if (vb_n) rec_CmdBindVertexBuffers(cb, vb_first, vb_n, vb_b, vb_o);
+#undef VB_BIND
 
     if (profd) prof_vertex_bind += SDL_GetTicksNS() - prof_index_start;
     if (profd) prof_vtx += SDL_GetTicksNS() - prof_t2_;
@@ -10320,7 +10440,7 @@ have_pipe:
     }
     if (use_index ? icount : count) hdr_record_draw(pr);
     if (!use_index) rec_CmdDraw(cb, count, inst, first, base_inst);
-    else rec_CmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
+    else rec_CmdDrawIndexed(cb, icount, inst, first_index, base_vertex, base_inst);
     if (oq >= 0) rec_CmdEndQuery(cb, oq_pool, (uint32_t)oq);
     stat_draws++;
     draws_total++;

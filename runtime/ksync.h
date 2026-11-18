@@ -7,8 +7,8 @@
 // other side usually answers within ~20 us). The sleep is the OS's address wait (Windows 8+ WaitOnAddress, Linux
 // futex). Where there is none (macOS, Windows 7) or SAVAGEWIND_KSYNC=0, every call goes to the pthread members
 // instead, as before.
-//   SAVAGEWIND_KSYNC_SPIN=<us>  how long a waiting thread spins before it sleeps (default 20, 0: never; and 0 on
-//                               machines with fewer than 6 logical processors)
+//   SAVAGEWIND_KSYNC_SPIN=<us>  how long a waiting thread spins before it sleeps (default 20, 0: never; and 0 where
+//                               the game runs on fewer than 6 logical processors unless it is set)
 #pragma once
 #include <pthread.h>
 #include <stdbool.h>
@@ -40,3 +40,5 @@ void kcond_broadcast(KCond *c);
 // pthread_cond_wait). The timed one takes an absolute CLOCK_REALTIME time; false if it ran out.
 void kcond_wait(KCond *c, KMutex *m);
 bool kcond_timedwait(KCond *c, KMutex *m, const struct timespec *abs);
+// The process's processors changed (main.c, after plat_cpu_placement): the waits' spin is decided again
+void ksync_cpus_changed(void);

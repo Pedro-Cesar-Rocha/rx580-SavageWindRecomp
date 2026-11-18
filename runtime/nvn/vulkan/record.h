@@ -24,6 +24,9 @@ void rec_EndCommandBuffer(VkCommandBuffer cb);
 void rec_QueueSubmit2(const VkSubmitInfo2 *si, uint64_t seq);
 // n writes of one descriptor each (buffer or image info), in order with the commands
 void rec_UpdateDescriptorSets(uint32_t n, const VkWriteDescriptorSet *w);
+// One set's descriptors through an update template: n entries of 24 bytes each (VkDescriptorImageInfo or
+// VkDescriptorBufferInfo, the template's offsets), in order with the commands
+void rec_UpdateDescriptorSetTemplate(VkDescriptorSet set, VkDescriptorUpdateTemplate t, uint32_t n, const void *data);
 // fn(arg) made by the recorder in its turn, in order with the commands (at once with the recorder off)
 void rec_custom(void (*fn)(void *), void *arg);
 

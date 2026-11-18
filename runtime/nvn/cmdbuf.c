@@ -43,17 +43,116 @@ typedef struct Shadow {
     bool dead;        // overlapped: out of the live list (freed when its last user leaves)
 } Shadow;
 
-static Shadow **g_live;  // shadows of guest memory, sorted by lo, never overlapping
-static int g_nlive, g_caplive;
+// The live shadows of guest memory, sorted by lo, never overlapping (a shadow's hi is at most the next one's lo): in
+// buckets of up to LIVE_B, in order, each holding its shadows' lo (fixed once made) beside the shadows. BOTW's open
+// world keeps ~43,000 live (~370 MB of records: its command memory is large, and lists die only when written over), and
+// one flat sorted array of them took a memmove of up to 340 KB under g_shadow_lock for each list made or recorded over,
+// with a binary search of pointer chases: with the lock's contention, ~6% of the game's main thread's busy time and ~8%
+// of its two job workers' (all three record NVN commands; Kakariko, RX 580 + i3-10105F). A place is (bucket, index);
+// the end is (g_nlb, 0).
+#define LIVE_B 256
+typedef struct { int n; uint64_t lo[LIVE_B]; Shadow *sh[LIVE_B]; } LiveBucket;
+typedef struct { int b, i; } LivePos;
+static LiveBucket **g_lb;
+static int g_nlb, g_caplb, g_nlive;
 static HBlock *g_free;   // blocks ready for reuse
 static int g_nfree, g_capfree;
 static uint64_t g_free_bytes;
 #define FREE_BUDGET (64ull << 20)  // dead blocks past this go back to the C heap
-static HBlock *g_grave;  // dead blocks, oldest first, until three frames have passed
-static int g_ngrave, g_capgrave;
+static HBlock *g_grave;  // dead blocks, oldest first from g_grave_at, until three frames have passed
+static int g_ngrave, g_capgrave, g_grave_at;
 static KMutex g_shadow_lock = KMUTEX_INIT;
 static NvnCmdBuf *g_command_buffers;
 uint64_t renderer_present_count(void);
+
+static Shadow *live_get(LivePos p) { return p.b < g_nlb ? g_lb[p.b]->sh[p.i] : NULL; }  // (lock held) NULL: the end
+static LivePos live_next(LivePos p) { return ++p.i < g_lb[p.b]->n ? p : (LivePos){p.b + 1, 0}; }  // (p not the end)
+static void lb_insert_at(int b, LiveBucket *k) {  // (lock held) a bucket into place b of the order
+    if (g_nlb == g_caplb) {
+        g_caplb = g_caplb ? g_caplb * 2 : 64;
+        g_lb = realloc(g_lb, g_caplb * sizeof *g_lb);
+        if (!g_lb) FATAL("nvn: out of host memory for command list shadows\n");
+    }
+    memmove(g_lb + b + 1, g_lb + b, (g_nlb - b) * sizeof *g_lb);
+    g_lb[b] = k;
+    g_nlb++;
+}
+static void lb_remove_at(int b) {  // (lock held) bucket b out of the order (freed)
+    free(g_lb[b]);
+    memmove(g_lb + b, g_lb + b + 1, (g_nlb - b - 1) * sizeof *g_lb);
+    g_nlb--;
+}
+// (lock held) The first live shadow not wholly before lo. Only the last shadow starting below lo can reach past it
+// (the ones before it end at or before its start), so the search is on the starts alone, then that one's end.
+static LivePos live_find(uint64_t lo) {
+    int a = 0, b = g_nlb;  // a: the buckets whose first shadow starts below lo
+    while (a < b) {
+        int m = (a + b) / 2;
+        if (g_lb[m]->lo[0] < lo) a = m + 1; else b = m;
+    }
+    if (!a) return (LivePos){0, 0};
+    LiveBucket *k = g_lb[a - 1];
+    int x = 0, y = k->n;  // x: its shadows starting below lo (at least the first)
+    while (x < y) {
+        int m = (x + y) / 2;
+        if (k->lo[m] < lo) x = m + 1; else y = m;
+    }
+    LivePos p = {a - 1, x - 1};
+    return k->sh[x - 1]->hi <= lo ? live_next(p) : p;
+}
+// (lock held) sh, starting at lo, in at p (before what is there, or last at the end); returns its place
+static LivePos live_insert(LivePos p, uint64_t lo, Shadow *sh) {
+    if (!g_nlb) {
+        LiveBucket *k = calloc(1, sizeof *k);
+        if (!k) FATAL("nvn: out of host memory for command list shadows\n");
+        lb_insert_at(0, k);
+        p = (LivePos){0, 0};
+    } else if (p.b == g_nlb) {
+        p = (LivePos){g_nlb - 1, g_lb[g_nlb - 1]->n};
+    }
+    LiveBucket *k = g_lb[p.b];
+    if (k->n == LIVE_B) {  // full: its upper half to a new bucket after it
+        LiveBucket *nk = calloc(1, sizeof *nk);
+        if (!nk) FATAL("nvn: out of host memory for command list shadows\n");
+        int h = LIVE_B / 2;
+        nk->n = LIVE_B - h;
+        memcpy(nk->lo, k->lo + h, nk->n * sizeof *k->lo);
+        memcpy(nk->sh, k->sh + h, nk->n * sizeof *k->sh);
+        k->n = h;
+        lb_insert_at(p.b + 1, nk);
+        if (p.i > h) p = (LivePos){p.b + 1, p.i - h}, k = nk;
+    }
+    memmove(k->lo + p.i + 1, k->lo + p.i, (k->n - p.i) * sizeof *k->lo);
+    memmove(k->sh + p.i + 1, k->sh + p.i, (k->n - p.i) * sizeof *k->sh);
+    k->lo[p.i] = lo;
+    k->sh[p.i] = sh;
+    k->n++;
+    g_nlive++;
+    return p;
+}
+// (lock held) n shadows from p on out of the order (killing them is the caller's); returns the place of what followed
+static LivePos live_remove(LivePos p, int n) {
+    while (n > 0 && p.b < g_nlb) {
+        LiveBucket *k = g_lb[p.b];
+        int m = k->n - p.i < n ? k->n - p.i : n;
+        memmove(k->lo + p.i, k->lo + p.i + m, (k->n - p.i - m) * sizeof *k->lo);
+        memmove(k->sh + p.i, k->sh + p.i + m, (k->n - p.i - m) * sizeof *k->sh);
+        k->n -= m;
+        g_nlive -= m;
+        n -= m;
+        if (!k->n) lb_remove_at(p.b);  // (emptied: p.i was 0, and p is now the next bucket's start)
+        else if (p.i >= k->n) p = (LivePos){p.b + 1, 0};
+    }
+    if (p.b > 0 && p.b < g_nlb && g_lb[p.b - 1]->n + g_lb[p.b]->n <= LIVE_B / 2) {  // (two small ones: one bucket)
+        LiveBucket *a = g_lb[p.b - 1], *k = g_lb[p.b];
+        memcpy(a->lo + a->n, k->lo, k->n * sizeof *k->lo);
+        memcpy(a->sh + a->n, k->sh, k->n * sizeof *k->sh);
+        p = (LivePos){p.b - 1, a->n + p.i};
+        a->n += k->n;
+        lb_remove_at(p.b + 1);
+    }
+    return p;
+}
 
 static void push_block(HBlock **v, int *n, int *cap, HBlock b) {
     if (*n == *cap) {
@@ -75,20 +174,27 @@ static HBlock block_get(uint64_t want) {  // (lock held) a free block that fits 
     if (stats < 0) stats = getenv("SAVAGEWIND_CMD_STATS") != NULL;
     if (stats && now >= stats_at) {  // (test) what the command records hold, every 600 frames
         uint64_t live = 0;
-        for (int i = 0; i < g_nlive; i++)
-            for (int j = 0; j < g_live[i]->nblocks; j++) live += g_live[i]->blocks[j].size;
+        for (int b = 0; b < g_nlb; b++)
+            for (int i = 0; i < g_lb[b]->n; i++)
+                for (int j = 0; j < g_lb[b]->sh[i]->nblocks; j++) live += g_lb[b]->sh[i]->blocks[j].size;
         LOG("[cmdbuf] frame %llu: %d lists' shadows, %llu MB of records; %d free blocks, %llu MB\n",
             (unsigned long long)now, g_nlive, (unsigned long long)(live >> 20), g_nfree,
             (unsigned long long)(g_free_bytes >> 20));
         stats_at = now + 600;
     }
-    int k = 0;
+    int k = g_grave_at;
     for (; k < g_ngrave && now - g_grave[k].frame >= 3; k++) {
         if (g_free_bytes + g_grave[k].size > FREE_BUDGET) { free(g_grave[k].mem); continue; }
         g_free_bytes += g_grave[k].size;
         push_block(&g_free, &g_nfree, &g_capfree, g_grave[k]);
     }
-    if (k) memmove(g_grave, g_grave + k, (g_ngrave -= k) * sizeof *g_grave);
+    g_grave_at = k;
+    if (g_grave_at > 256 && g_grave_at > g_ngrave - g_grave_at) {  // (the taken ones off the front now and then: a
+        // memmove of the whole grave each time was one more under the lock, with blocks dying by the hundred a frame)
+        memmove(g_grave, g_grave + g_grave_at, (g_ngrave - g_grave_at) * sizeof *g_grave);
+        g_ngrave -= g_grave_at;
+        g_grave_at = 0;
+    }
     for (int i = g_nfree - 1; i >= 0; i--)
         if (g_free[i].size >= want && g_free[i].size <= want * 4) {
             HBlock b = g_free[i];
@@ -113,15 +219,6 @@ static void shadow_unuse(Shadow *sh) {  // (lock held)
     if (!--sh->users && sh->dead) { free(sh->blocks); free(sh); }
 }
 
-static int live_index(uint64_t lo) {  // (lock held) the first live shadow not wholly before lo
-    int a = 0, b = g_nlive;
-    while (a < b) {
-        int m = (a + b) / 2;
-        if (g_live[m]->hi <= lo && g_live[m]->lo < lo) a = m + 1; else b = m;
-    }
-    return a;
-}
-
 // A command buffer moves from shadow `old` (NULL: none yet), having used `used` guest bytes there, to the shadow
 // for guest memory [lo, hi): the same one when the game adds exactly that range again, unless that is the one
 // being recorded into (`recording`: its blocks still hold the start of the list); otherwise a new one, and the
@@ -132,25 +229,25 @@ static Shadow *shadow_switch(Shadow *old, uint64_t used, bool recording, uint64_
     if (old && !old->dead && old->lo < old->hi && old->lo + used < old->hi) old->hi = old->lo + used;
     Shadow *sh = NULL;
     if (lo < hi) {
-        int a = live_index(lo);
-        Shadow *same = a < g_nlive && g_live[a]->lo == lo && g_live[a]->win == hi ? g_live[a] : NULL;
+        LivePos a = live_find(lo);
+        Shadow *at = live_get(a);
+        Shadow *same = at && at->lo == lo && at->win == hi ? at : NULL;
         if (same && (same->users == (same == old)) && !(recording && same == old)) sh = same;
         else {
-            int end = a;
-            while (end < g_nlive && g_live[end]->lo <= lo) end++;
-            for (int i = a; i < end; i++) shadow_kill(g_live[i]);
-            if (g_nlive - (end - a) + 1 > g_caplive) {
-                g_caplive = g_caplive ? g_caplive * 2 : 1024;
-                g_live = realloc(g_live, g_caplive * sizeof *g_live);
-            }
-            memmove(g_live + a + 1, g_live + end, (g_nlive - end) * sizeof *g_live);
-            g_nlive += 1 - (end - a);
+            // (the shadows from a on that start at or before lo die: the one reaching over lo, the one starting there)
+            int n = 0;
+            for (LivePos p = a; (at = live_get(p)) && at->lo <= lo; p = live_next(p), n++) shadow_kill(at);
+            a = live_remove(a, n);
             sh = calloc(1, sizeof *sh);
             sh->lo = sh->hi = lo;
             sh->win = hi;
-            sh->free_to = a + 1 < g_nlive && g_live[a + 1]->lo < hi ? g_live[a + 1]->lo : hi;
-            g_live[a] = sh;
-            if (a > 0 && g_live[a - 1]->free_to > lo) g_live[a - 1]->free_to = lo;
+            Shadow *next = live_get(a);
+            sh->free_to = next && next->lo < hi ? next->lo : hi;
+            a = live_insert(a, lo, sh);
+            if (a.i || a.b) {  // (the one before it: no claim past lo without the lock from now on)
+                Shadow *prev = a.i ? g_lb[a.b]->sh[a.i - 1] : g_lb[a.b - 1]->sh[g_lb[a.b - 1]->n - 1];
+                if (prev->free_to > lo) prev->free_to = lo;
+            }
         }
     } else {
         sh = calloc(1, sizeof *sh);
@@ -168,16 +265,17 @@ static void shadow_claim(Shadow *sh, uint64_t end) {
     if (end <= sh->free_to) { sh->hi = end; return; }
     kmutex_lock(&g_shadow_lock);
     if (!sh->dead) {
-        int i = live_index(sh->lo);
-        while (i < g_nlive && g_live[i] != sh) i++;
-        if (i < g_nlive) {
-            int last = i + 1;
-            while (last < g_nlive && g_live[last]->lo < end) last++;
-            for (int k = i + 1; k < last; k++) shadow_kill(g_live[k]);
-            memmove(g_live + i + 1, g_live + last, (g_nlive - last) * sizeof *g_live);
-            g_nlive -= last - (i + 1);
+        LivePos i = live_find(sh->lo);
+        Shadow *at;
+        while ((at = live_get(i)) && at != sh) i = live_next(i);
+        if (at) {
+            LivePos p = live_next(i);
+            int n = 0;
+            for (LivePos q = p; (at = live_get(q)) && at->lo < end; q = live_next(q), n++) shadow_kill(at);
+            p = live_remove(p, n);
             sh->hi = end;
-            sh->free_to = i + 1 < g_nlive && g_live[i + 1]->lo < sh->win ? g_live[i + 1]->lo : sh->win;
+            Shadow *next = live_get(p);
+            sh->free_to = next && next->lo < sh->win ? next->lo : sh->win;
         }
     }
     kmutex_unlock(&g_shadow_lock);
@@ -193,11 +291,11 @@ static void shadow_leave(Shadow *sh, uint64_t used) {  // (a command buffer is f
 // A memory pool is finalized: the lists recorded in its memory [lo, hi) are dead.
 void cmdbuf_pool_gone(uint64_t lo, uint64_t hi) {
     kmutex_lock(&g_shadow_lock);
-    int a = live_index(lo), end = a;
-    while (end < g_nlive && g_live[end]->lo < hi) end++;
-    for (int i = a; i < end; i++) shadow_kill(g_live[i]);
-    memmove(g_live + a, g_live + end, (g_nlive - end) * sizeof *g_live);
-    g_nlive -= end - a;
+    LivePos a = live_find(lo);
+    Shadow *at;
+    int n = 0;
+    for (LivePos p = a; (at = live_get(p)) && at->lo < hi; p = live_next(p), n++) shadow_kill(at);
+    live_remove(a, n);
     kmutex_unlock(&g_shadow_lock);
 }
 
@@ -228,14 +326,18 @@ RT_ON_RESET(cmdbuf_shadow_reset) {  // (reboot: every list is dead; command buff
         g_command_buffers = cb->registry_next;
         free(cb);
     }
-    for (int i = 0; i < g_nlive; i++) {
-        for (int k = 0; k < g_live[i]->nblocks; k++) free(g_live[i]->blocks[k].mem);
-        free(g_live[i]->blocks);
-        free(g_live[i]);
+    for (int b = 0; b < g_nlb; b++) {
+        LiveBucket *k = g_lb[b];
+        for (int i = 0; i < k->n; i++) {
+            for (int j = 0; j < k->sh[i]->nblocks; j++) free(k->sh[i]->blocks[j].mem);
+            free(k->sh[i]->blocks);
+            free(k->sh[i]);
+        }
+        free(k);
     }
-    g_nlive = 0;
-    for (int i = 0; i < g_ngrave; i++) free(g_grave[i].mem);
-    g_ngrave = 0;
+    g_nlb = g_nlive = 0;
+    for (int i = g_grave_at; i < g_ngrave; i++) free(g_grave[i].mem);
+    g_ngrave = g_grave_at = 0;
     kmutex_unlock(&g_shadow_lock);
 }
 
@@ -245,7 +347,9 @@ NVN(nvnCommandBufferInitialize) {
     NvnCmdBuf *cb = calloc(1, sizeof *cb);
     cb->guest = A(0);
     kmutex_lock(&g_shadow_lock);
-    cb->registry_next = g_command_buffers; g_command_buffers = cb;
+    cb->registry_next = g_command_buffers;
+    if (g_command_buffers) g_command_buffers->registry_prev = cb;
+    g_command_buffers = cb;
     kmutex_unlock(&g_shadow_lock);
     SET_HOST(A(0), cb);
     RET(1);
@@ -253,9 +357,11 @@ NVN(nvnCommandBufferInitialize) {
 NVN(nvnCommandBufferFinalize) {
     NvnCmdBuf *cb = cb_of(A(0));
     kmutex_lock(&g_shadow_lock);
-    NvnCmdBuf **link = &g_command_buffers;
-    while (*link && *link != cb) link = &(*link)->registry_next;
-    if (*link) *link = cb->registry_next;
+    if (cb) {  // (unlinked in place: the registry was walked from its newest to this one, under the lock)
+        if (cb->registry_prev) cb->registry_prev->registry_next = cb->registry_next;
+        else if (g_command_buffers == cb) g_command_buffers = cb->registry_next;
+        if (cb->registry_next) cb->registry_next->registry_prev = cb->registry_prev;
+    }
     kmutex_unlock(&g_shadow_lock);
     if (cb && cb->shadow) shadow_leave(cb->shadow, cb->gused);
     free(cb);

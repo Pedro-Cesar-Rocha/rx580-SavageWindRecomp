@@ -98,6 +98,11 @@ typedef struct {
     bool uses_gather;  // (GLSL) a gather: the GATHER_BIAS specialization constant is declared
 } Ctx;
 
+// (Vulkan) this shader's global memory reads come from the heap's copy in video memory (maxwell_gmem_mirror: compute)
+static bool gmem_mirrored(const Ctx *c) {
+    return c->glsl && maxwell_gmem_mirror && !maxwell_gmem_bda && c->stage == STAGE_COMPUTE;
+}
+
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
 static int64_t sbits(uint64_t w, int lo, int n) {
     int64_t v = (int64_t)bits(w, lo, n);
@@ -1778,7 +1783,12 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     sp(&c->body, "      if (ok) { uint wi = uint(ga >> 2); uint sh = uint(ga & %s) * 8u; uint gm = ~(0x%xu << sh), gv = (%s & 0x%xu) << sh; "
                        "%s }\n", size < 2 ? "3ul" : "2ul", size < 2 ? 0xFFu : 0xFFFFu, R(d),
                        size < 2 ? 0xFFu : 0xFFFFu,
-                       maxwell_gmem_split ? "if (wi < GSPLIT) { atomicAnd(gmem_.w[wi], gm); atomicOr(gmem_.w[wi], gv); } "
+                       gmem_mirrored(c) ? (maxwell_gmem_split
+                           ? "if (wi < GSPLIT) { atomicAnd(gmem_.w[wi], gm); atomicOr(gmem_.w[wi], gv); atomicAnd(gmemv_.w[wi], gm); "
+                             "atomicOr(gmemv_.w[wi], gv); } else { atomicAnd(gmem2_.w[wi - GSPLIT], gm); atomicOr(gmem2_.w[wi - GSPLIT], gv); "
+                             "atomicAnd(gmemv2_.w[wi - GSPLIT], gm); atomicOr(gmemv2_.w[wi - GSPLIT], gv); }"
+                           : "atomicAnd(gmem_.w[wi], gm); atomicOr(gmem_.w[wi], gv); atomicAnd(gmemv_.w[wi], gm); atomicOr(gmemv_.w[wi], gv);")
+                       : maxwell_gmem_split ? "if (wi < GSPLIT) { atomicAnd(gmem_.w[wi], gm); atomicOr(gmem_.w[wi], gv); } "
                                             "else { atomicAnd(gmem2_.w[wi - GSPLIT], gm); atomicOr(gmem2_.w[wi - GSPLIT], gv); }"
                                           : "atomicAnd(gmem_.w[wi], gm); atomicOr(gmem_.w[wi], gv);");
                 else
@@ -2281,11 +2291,25 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (split)
             sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem2 { uint w[]; } gmem2_;\n", set, GMEM2_BUFFER_INDEX,
                c->uses_gmem_store ? "" : "readonly ");
-        if (split) sp(&s, "#define GSPLIT 0x%xu\n#define GLD0(i) ((i) < GSPLIT ? gmem_.w[(i)] : gmem2_.w[(i) - GSPLIT])\n", (unsigned)(GMEM_SPLIT >> 2));
-        else sp(&s, "#define GLD0(i) gmem_.w[(i)]\n");
+        bool mirror = gmem_mirrored(c);
+        if (mirror) {  // (maxwell_gmem_mirror) reads from the copy in video memory, writes to both
+            sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMemV { uint w[]; } gmemv_;\n", set, GMEMV_BUFFER_INDEX,
+               c->uses_gmem_store ? "" : "readonly ");
+            if (split)
+                sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMemV2 { uint w[]; } gmemv2_;\n", set, GMEMV2_BUFFER_INDEX,
+                   c->uses_gmem_store ? "" : "readonly ");
+        }
+        const char *g1 = mirror ? "gmemv_" : "gmem_", *g2 = mirror ? "gmemv2_" : "gmem2_";
+        if (split) sp(&s, "#define GSPLIT 0x%xu\n#define GLD0(i) ((i) < GSPLIT ? %s.w[(i)] : %s.w[(i) - GSPLIT])\n", (unsigned)(GMEM_SPLIT >> 2), g1, g2);
+        else sp(&s, "#define GLD0(i) %s.w[(i)]\n", g1);
         if (c->uses_gmem_store || !maxwell_gmem_snap) {
             sp(&s, "#define GLD(i) GLD0(i)\n");
-            if (split)
+            if (split && mirror)
+                sp(&s, "#define GST(i, v) { uint gi_ = (i), gv_ = (v); if (gi_ < GSPLIT) { gmem_.w[gi_] = gv_; gmemv_.w[gi_] = gv_; } "
+                       "else { gmem2_.w[gi_ - GSPLIT] = gv_; gmemv2_.w[gi_ - GSPLIT] = gv_; } }\n");
+            else if (mirror)
+                sp(&s, "#define GST(i, v) { uint gi_ = (i), gv_ = (v); gmem_.w[gi_] = gv_; gmemv_.w[gi_] = gv_; }\n");
+            else if (split)
                 sp(&s, "#define GST(i, v) { uint gi_ = (i); if (gi_ < GSPLIT) gmem_.w[gi_] = (v); else gmem2_.w[gi_ - GSPLIT] = (v); }\n");
             else
                 sp(&s, "#define GST(i, v) { gmem_.w[(i)] = (v); }\n");
@@ -2486,11 +2510,12 @@ const char *maxwell_translator_id(void) { return TRANSLATOR_ID; }
 // the variant it was made under; one of a global memory shader made under another is translated again
 // (shaders.c xlate_load), the rest are kept: a change of these switches (a device, a driver, a new default in exec.c)
 // no longer throws every cache away, as it did when they were part of the translator's id.
-bool maxwell_gmem_split, maxwell_gmem_snap, maxwell_gmem_bda;
+bool maxwell_gmem_split, maxwell_gmem_snap, maxwell_gmem_bda, maxwell_gmem_mirror;
 const char *maxwell_translation_variant(void) {
     static __thread char v[64];  // (per thread: the precompile's workers ask for it at once)
-    snprintf(v, sizeof v, "%s%s%s %llx+%llx", maxwell_gmem_split ? "s" : "-", maxwell_gmem_snap ? "n" : "-",
+    snprintf(v, sizeof v, "%s%s%s%s %llx+%llx", maxwell_gmem_split ? "s" : "-", maxwell_gmem_snap ? "n" : "-",
              maxwell_gmem_bda ? "a" : "",  // (by address: Turnip; nothing added otherwise, so other caches stay valid)
+             maxwell_gmem_mirror ? "m" : "",  // (compute shaders read a copy in video memory: discrete GPUs)
              (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
     return v;
 }

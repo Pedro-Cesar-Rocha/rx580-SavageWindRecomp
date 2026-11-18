@@ -180,12 +180,65 @@ static bool format_is_float(VkFormat f) {  // (uncompressed: these can hold NaN 
 //             2048 to 8192) they are made at instead of the game's (output_scale.c shadow_map_size). Also
 //             their half-size copy (R16 448x448x3, the max of each 2x2), at the same factor: water and the other
 //             forward-shaded surfaces take their shadows from it (issue #101)
-static float g_rs[4][2] = {{1, 1}, {1, 1}, {1, 1}, {1, 1}};
+static float g_rs[5][2] = {{1, 1}, {1, 1}, {1, 1}, {1, 1}, {1, 1}};
+// RS_HALF: the scene's effect targets of half its size and less (BOTW's 800x450 and smaller: ambient occlusion, fog,
+// depth of field, the light buffers they blur and upsample), at a scale capped at half_cap: Video > Effects resolution
+// (settings.h effects_res: 1.2x balanced, 1x console; full: no cap, they stay RS_SCENE), read once at the start (the
+// group is a texture's for good). At 2560x1440 they took 4.2 of an RX 580's 17.7 ms (Kakariko); capped at 1x, 2.6
+// (61.7 -> 68.9 fps); the effects, blurred and upsampled anyway, looked the same in screenshots.
+// SAVAGEWIND_HALF_SCALE=<x>: that cap instead (0: none).
+static float half_cap(void) {
+    static float c = -1;
+    if (c < 0) {
+        const char *e = getenv("SAVAGEWIND_HALF_SCALE");
+        c = e && *e ? (float)atof(e) : g_settings.effects_res == EFFRES_CONSOLE ? 1.0f
+                                     : g_settings.effects_res == EFFRES_BALANCED ? 1.2f : 0.0f;
+        if (c < 0) c = 0;
+        if (c > 0) LOG("[vk] the scene's half-size effect targets: scaled at most %.2fx\n", c);
+        else LOG("[vk] the scene's half-size effect targets: at the scene's scale\n");
+    }
+    return c;
+}
 static uint32_t g_shadow_size;
 void renderer_get_scale(float *sx, float *sy) { *sx = g_rs[RS_OUT][0]; *sy = g_rs[RS_OUT][1]; }
 void renderer_set_scale(float sx, float sy) { g_rs[RS_OUT][0] = sx; g_rs[RS_OUT][1] = sy; }
 void renderer_get_scene_scale(float *sx, float *sy) { *sx = g_rs[RS_SCENE][0]; *sy = g_rs[RS_SCENE][1]; }
-void renderer_set_scene_scale(float sx, float sy) { g_rs[RS_SCENE][0] = sx; g_rs[RS_SCENE][1] = sy; }
+// AMD's own driver on a GCN chip (an RX 580) lays out a 32-bit render target that is not a multiple of 256 pixels
+// wide and 128 rows tall so that the GPU reaches its memory at half the speed: 2560x1440, 1920x1080, 1920x1152 or
+// 1600x1024 cleared at ~65 GB/s and copied at ~102 GB/s, 2560x1408, 2048x1024 or 1280x768 at ~130-147 and ~185
+// (SAVAGEWIND_VK_MEMBENCH; the format, usage and mutable flag made no difference). Every pass of the 3D scene reads
+// and writes its targets (1600x900 docked: 2560x1440 at 160 %). Where both of its sides are within 3 % of such a
+// size, the scene's scale goes to it - 2560x1440 -> 2560x1408 (an RX 580 at Render scale 133 % on a 1080p window:
+// GPU 10.6 -> 8.0 ms a frame on the Great Plateau), 3840x2160 -> 3840x2176 -; the composite scales the scene into the
+// final image as before. Elsewhere (1920x1080: 2048x1152 is 14 % more pixels) it stays as scaled.
+// SAVAGEWIND_VK_ALIGN_ROWS=<rows>: rows to align to, 0: off (the width: twice as many pixels).
+static float align_to(float s, float guest, int a) {  // s for guest * s a multiple of a, if within 3 %; else -1
+    float v = guest * s, n = roundf(v / (float)a) * (float)a;
+    return n >= (float)a && fabsf(n - v) <= 0.03f * v ? n / guest : -1.0f;
+}
+
+void renderer_set_scene_scale(float sx, float sy) {
+    static int a = -1;
+    if (a < 0) {
+        const char *e = getenv("SAVAGEWIND_VK_ALIGN_ROWS");
+        a = e && *e ? atoi(e) : g_vk.amd_gcn ? 128 : 0;
+        if (a > 0) LOG("[vk] 3D scene targets: %d pixels wide and %d rows tall multiples where near\n", 2 * a, a);
+    }
+    if (a > 0) {  // (BOTW's scene targets, docked: 1600x900)
+        float ax = align_to(sx, 1600.0f, 2 * a), ay = align_to(sy, 900.0f, a);
+        static float px, py;
+        if (sx != px || sy != py) {
+            px = sx, py = sy;
+            if (ax > 0 && ay > 0) LOG("[vk] 3D scene %.0fx%.0f made %.0fx%.0f\n", 1600.0f * sx, 900.0f * sy, 1600.0f * ax, 900.0f * ay);
+            else LOG("[vk] 3D scene %.0fx%.0f kept (no aligned size within 3 %%)\n", 1600.0f * sx, 900.0f * sy);
+        }
+        if (ax > 0 && ay > 0) sx = ax, sy = ay;
+    }
+    g_rs[RS_SCENE][0] = sx; g_rs[RS_SCENE][1] = sy;
+    float c = half_cap();
+    g_rs[RS_HALF][0] = c > 0 && sx > c ? c : sx;
+    g_rs[RS_HALF][1] = c > 0 && sy > c ? c : sy;
+}
 void renderer_set_shadow_size(uint32_t n) {  // (never past what the GPU can make: Extreme is 8192)
     g_shadow_size = n < g_vk.props.limits.maxImageDimension2D ? n : g_vk.props.limits.maxImageDimension2D;
 }
@@ -245,6 +298,7 @@ static uint8_t tex_scale_group(const NvnTexture *t) {
         if ((t->width == 1920u >> k || t->width == (1920u + (1u << k) - 1) >> k) &&
             (t->height == 1080u >> k || t->height == (1080u + (1u << k) - 1) >> k))
             return RS_OUT;
+    if (half_cap() > 0 && t->width <= 960) return RS_HALF;  // (the full scene is 1280 wide and up, docked or with DRS)
     return RS_SCENE;
 }
 
@@ -696,8 +750,15 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     // draws into it
     b->dl = 0;
     b->dl_attached = false;
+    b->dl_since = 0;
     b->dl_ok = depthfmt && type == VK_IMAGE_TYPE_2D && levels == 1 && samples == 1 &&
                (ci.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) && vk_depth_layouts();
+    // (colour targets too, vk_color_layouts: 2D, one level and layer, with a list of their view formats - DCC needs it -,
+    // not a linear target the CPU reads back, not the final image or an HDR one: the present and HDR code read those)
+    if (!depthfmt && type == VK_IMAGE_TYPE_2D && levels == 1 && layers == 1 && samples == 1 &&
+        (ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && b->nview_fmt && !(t->flags & 0x40) && !hdr_up &&
+        b->rs_group != RS_OUT && !b->feedback_ok && vk_color_layouts())
+        b->dl_ok = true;
     b->cube_ok = (ci.flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0;
     b->not_attachable = !(ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
     static uint64_t serials;
@@ -1196,9 +1257,13 @@ static void upload_pending(TexBackend *b) {
     VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = stride / 4,
                             .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
     VkCommandBuffer cb = vk_upload_cmd();
-    if (scaled) { upload_scaled(cb, b, s, rg, w, h); return; }
-    vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
-                rec_CmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    vk_dl_upload(cb, b, true);  // (a tracked target: out of its resting layout for the copy, exec.c)
+    if (scaled) upload_scaled(cb, b, s, rg, w, h);
+    else {
+        vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
+        rec_CmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    }
+    vk_dl_upload(cb, b, false);
 }
 
 uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn;
@@ -1422,6 +1487,7 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
     if (!t->addr || t->target == 10 || !fi || !fi->bpb || !storage_readable(t, storage_size(t))) return;
     if (b->format != mf.vf && !b->astc_bw && !b->bc4_cpu) return;  // unsupported format: nothing sensible to copy
     VkCommandBuffer cb = vk_upload_cmd();
+    vk_dl_upload(cb, b, true);  // (a tracked target: out of its resting layout for the copies, exec.c)
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
     if (layers > b->layers && b->depth == 1) layers = b->layers;
     bool linear = nvn_texture_flags_pitch(t->flags);
@@ -1578,6 +1644,7 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
                 rec_CmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
         }
     }
+    vk_dl_upload(cb, b, false);
 }
 
 // (debugging) SAVAGEWIND_TRACE_TEX=<w>x<h>[,<w>x<h>...] or all: textures keep a history of their last writes (draws
@@ -1747,6 +1814,8 @@ bool vk_native_post_target(NvnTexture *t) {
 void vk_texture_drop_format_list(NvnTexture *t) {
     TexBackend *b = tex_backend(t);
     if (!b->nview_fmt || !b->image) return;
+    vk_dl_general(b);  // (a tracked target: the old image in GENERAL for the copy below, then no longer tracked)
+    vk_dl_forget(b);
     VkImage old = b->image;
     VmaAllocation old_mem = b->mem;
     views_forget(b);

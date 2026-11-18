@@ -39,6 +39,9 @@ enum { RSCALE_50 = 0, RSCALE_75 = 1, RSCALE_100 = 2, RSCALE_125 = 3, RSCALE_133 
 #endif
 // Shadow resolution (Video > Shadow resolution; runtime/nvn/output_scale.c shadow_map_size): the sun's shadow maps at
 // the console's size (BOTW: 896 x 896) or made bigger, for sharper shadows at some GPU time.
+// The scene's half-size effect targets (vulkan/textures.c RS_HALF): at the scene's scale, at most 1.2x (the scale a
+// 1080p window gives them), at most 1x (the console's size)
+enum { EFFRES_FULL = 0, EFFRES_BALANCED = 1, EFFRES_CONSOLE = 2, EFFRES_COUNT };
 enum { SHADOW_CONSOLE = 0, SHADOW_HIGH = 1 /* 2048 */, SHADOW_ULTRA = 2 /* 4096 */, SHADOW_EXTREME = 3 /* 8192 */,
        SHADOW_POTATO = 4 /* 448 */, SHADOW_COUNT };
 enum { PERF_OFF = 0, PERF_FPS = 1, PERF_FULL = 2 };
@@ -146,6 +149,8 @@ typedef struct {
     bool boot_picture;        // that picture while the game loads (vulkan/device.c boot_splash_start); off: black
     bool check_updates;       // Savage Wind Configuration asks SW Update if there is a new version
     int shadow_res;      // SHADOW_*: shadow maps at the console's size, bigger, or (Potato) smaller
+    int effects_res;     // EFFRES_*: the scene's half-size effect targets (ambient occlusion, fog, depth of field) at its
+                         // render scale or capped (vulkan/textures.c RS_HALF); from the next start
     int sharper_menus;   // the menus' one-channel textures enlarged this many times (2 or 4; 0: off), runtime/nvn/text_upscale.c
     int sharper_text;    // the game's font sheets enlarged this many times (2 or 4; 0: off), runtime/nvn/text_upscale.c
     bool wide_view;      // a window that isn't 16:9 shows more of the world instead of bars (runtime/nvn/output_scale.c)

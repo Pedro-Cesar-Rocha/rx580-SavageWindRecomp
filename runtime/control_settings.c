@@ -44,7 +44,7 @@ static const Setting settings[] = {
     I(button_icons, 0, ICONS_COUNT - 1, "auto|keyboard|xbox|playstation|nintendo|steamdeck"),
     I(button_layout, 0, BUTTON_LAYOUT_COUNT - 1, "auto|nintendo|swap_ab|xbox|swap_xy|gamecube"),
     B(async_shaders), B(precompile_shaders), B(dlss_download), B(quick_sort), B(quick_drop), B(discord_rpc),
-    I(shadow_res, 0, SHADOW_COUNT - 1, "console|high|ultra|extreme|potato"), B(wide_view), B(hud_edges),
+    I(shadow_res, 0, SHADOW_COUNT - 1, "console|high|ultra|extreme|potato"), I(effects_res, 0, EFFRES_COUNT - 1, "full|balanced|console"), B(wide_view), B(hud_edges),
     I(hdr, 0, HDR_COUNT - 1, "auto|on|off"), I(hdr_white, 0, 1000, NULL),
     I(hdr_peak_nits, 0, 10000, NULL), I(hdr_game_nits, 0, 1000, NULL), I(hdr_hue, 0, 100, NULL),
     I(hdr_blowout, 0, 100, NULL), I(hdr_sdr_blend, 0, 60, NULL), I(hdr_vanilla_saturation, 0, 100, NULL),

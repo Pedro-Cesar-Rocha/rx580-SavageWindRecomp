@@ -65,8 +65,24 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
                 (unsigned long long)renderer_present_count());
         return VK_FALSE;
     }
+    // The first 5 messages of each kind in full, then the kind's count at each power of two (sync validation,
+    // VK_LAYER_VALIDATE_SYNC=true: a few hazards repeat thousands of times a frame and hid the rest)
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    static struct { char id[96]; unsigned n; } ids[128];
+    static int nids;
+    unsigned c = 1;
+    if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+        const char *id = d->pMessageIdName ? d->pMessageIdName : "?";
+        pthread_mutex_lock(&lk);
+        int k = 0;
+        while (k < nids && strcmp(ids[k].id, id)) k++;
+        if (k == nids && nids < 128) snprintf(ids[nids++].id, sizeof ids[0].id, "%s", id), ids[k].n = 0;
+        c = k < nids ? ++ids[k].n : 1;
+        pthread_mutex_unlock(&lk);
+        if (c > 5 && !(c & (c - 1))) LOG("[vk] validation: %s x%u (frame %llu)\n", id, c, (unsigned long long)renderer_present_count());
+    }
     static int n;
-    if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT && n++ < 500) {
+    if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT && c <= 5 && n++ < 2000) {
         LOG("[vk] %s\n", d->pMessage);
         // SAVAGEWIND_VK_VALIDATION_BT=1: the call stack of each error (with SAVAGEWIND_VK_RECORDER=0 it is the caller's)
         static int bt = -1;
@@ -237,6 +253,14 @@ static void pick_device(void) {
             break;
         }
     }
+    g_vk.xfer_family = UINT32_MAX;
+    for (uint32_t i = 0; i < nq; i++)  // (a family of the DMA engine: transfer only, exec.c xfer_readback)
+        if (i != g_vk.qfam && (qp[i].queueFlags & VK_QUEUE_TRANSFER_BIT) &&
+            !(qp[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) && qp[i].queueCount) {
+            g_vk.xfer_family = i;
+            LOG("[vk] queue family %u: flags %#x, queues %u (transfer only)\n", i, qp[i].queueFlags, qp[i].queueCount);
+            break;
+        }
     free(qp);
     if (g_vk.qfam == UINT32_MAX) FATAL("no graphics+present queue\n");
     LOG("[vk] using %s\n", g_vk.props.deviceName);
@@ -256,6 +280,8 @@ static void pick_device(void) {
     if (g_vk.props.vendorID == 0x8086 && lean_default && g_vk.props.apiVersion <= VK_MAKE_API_VERSION(0, 1, 3, 215))
         lean_default = false;
 #endif
+    // (exec.c colour layout tracking keeps DCC only for images with a list of their view formats: on with it)
+    if (vk_color_layouts()) lean_default = true;
     g_vk.lean_usage = lean && *lean ? atoi(lean) != 0 : lean_default;
     LOG("[vk] view format lists %s\n", g_vk.lean_usage ? "on" : "off");
     perfmon_set_gpu_hint(g_vk.props.deviceName);
@@ -622,8 +648,10 @@ static void create_device(void) {
     }
 #endif
     VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceSubgroupSizeControlProperties ssc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES,
+                                                         .pNext = &drv};
     {
-        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &ssc};
         vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
     }
 #ifdef __linux__
@@ -631,6 +659,7 @@ static void create_device(void) {
 #endif
     g_vk.turnip = drv.driverID == VK_DRIVER_ID_MESA_TURNIP;
     g_vk.amd_proprietary = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
+    g_vk.amd_gcn = g_vk.amd_proprietary && ssc.minSubgroupSize == 64;  // (RDNA runs waves of 32 too)
     {   // AMD's own shader compiler (its driver without "LLPC" in driverInfo: RDNA 2 and older on Windows) draws the sky
         // wrong from unoptimized SPIR-V (#359): its fragment shaders go through spirv-opt (spirv.c).
         // SAVAGEWIND_VK_OPT_FS=0 / 1 forces it off or on.
@@ -1023,9 +1052,17 @@ static void create_device(void) {
         }
         n_ext = k;
     }
-    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
-                             .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
+    // The DMA engine's queue for big read backs (exec.c xfer_readback): AMD's own driver by default;
+    // SAVAGEWIND_VK_ASYNC_READBACK=0 / 1 turns it off / on elsewhere
+    const char *ar = getenv("SAVAGEWIND_VK_ASYNC_READBACK");
+    bool xq = g_vk.xfer_family != UINT32_MAX && (ar && *ar ? atoi(ar) != 0 : g_vk.amd_proprietary);
+    VkDeviceQueueCreateInfo qis[2] = {qi, {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.xfer_family,
+                                          .queueCount = 1, .pQueuePriorities = prio}};
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = xq ? 2 : 1,
+                             .pQueueCreateInfos = qis, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    if (xq) vkGetDeviceQueue(g_vk.dev, g_vk.xfer_family, 0, &g_vk.xfer_queue);
+    LOG("[vk] big read backs through the DMA engine's queue: %s\n", g_vk.xfer_queue ? "on" : "off");
     free(ep);  // (read up to here: extended dynamic state and the FSR 4 checks above, #488)
     fsr_api_probe(g_vk.dev, g_vk.phys);  // (logs what AMD's FSR DLLs offer this device; a no-op without them)
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);

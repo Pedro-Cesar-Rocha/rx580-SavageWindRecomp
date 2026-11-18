@@ -9,6 +9,8 @@
 // One exception (exec.c "depth layout tracking", vk_depth_layouts: AMD's own driver by default): depth / stencil
 // targets a pass has drawn into rest in DEPTH_STENCIL_READ_ONLY_OPTIMAL and change layout lazily (attachment, transfer
 // source, GENERAL), so the driver keeps them compressed; a use of one outside exec.c takes its layout from there.
+// Colour targets the same way with vk_color_layouts (resting in SHADER_READ_ONLY_OPTIMAL); every tracked image is
+// in its resting layout at the end of each submission (a CPU upload, recorded before it: vk_dl_upload).
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -36,6 +38,8 @@ typedef struct {
     VkQueue queue;
     VkQueue present_queue;     // a second queue of the same family for presentation (device.c), or queue
     uint32_t qfam, qfam_count;
+    VkQueue xfer_queue;        // a transfer-only queue (the DMA engine) for big read backs (exec.c xfer_readback), or 0
+    uint32_t xfer_family;
     VmaAllocator vma;
     VkPhysicalDeviceProperties props;
     bool is_mali;              // Arm Mali (vendor 0x13B5): the Mali-only paths' default (tiler / non-coherent workarounds)
@@ -60,6 +64,8 @@ typedef struct {
     bool radv;                 // the driver is Mesa's RADV
     bool turnip;               // the driver is Mesa's Turnip (Qualcomm Adreno; exec.c ubo_dynamic_mark_stage)
     bool amd_proprietary;      // the driver is AMD's own (Windows; textures.c's cube-compatible rule, #59)
+    bool amd_gcn;              // ... on a GCN chip (Polaris, Vega: no wave32, minSubgroupSize 64), where it keeps no
+                               // image compressed in GENERAL (exec.c resolve_feedback's live reads)
     bool present_wait;         // VK_KHR_present_id + present_wait on (SAVAGEWIND_LOG_PRESENT: when frames are shown)
     bool hdr_metadata;         // VK_EXT_hdr_metadata: the HDR10 swapchain carries the peak/game nits
     bool fp16;                 // shaderFloat16 + 16-bit storage on (the FSR 3 upscaler's 16-bit shaders: fsr3.cpp)
@@ -102,8 +108,9 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout);
 
 // ---- textures (textures.c)
 // Render-target scale groups (textures.c tex_scale_group): none, the 3D scene's (internal resolution), the final
-// image's (the window's resolution), shadow maps (Video > Shadow resolution)
-enum { RS_NONE = 0, RS_SCENE = 1, RS_OUT = 2, RS_SHADOW = 3 };
+// image's (the window's resolution), shadow maps (Video > Shadow resolution), the scene's half- and quarter-size
+// effect targets when their scale is capped (textures.c RS_HALF)
+enum { RS_NONE = 0, RS_SCENE = 1, RS_OUT = 2, RS_SHADOW = 3, RS_HALF = 4 };
 
 typedef struct TexBackend {
     VkImage image;
@@ -172,6 +179,7 @@ typedef struct TexBackend {
     // layout is tracked from then on), dl the layout the whole image is in now (exec.c DL_*)
     bool dl_ok, dl_attached;
     uint8_t dl;
+    uint64_t dl_since;           // (exec.c) the submission in which a pass first drew into it (its layout tracked since)
 } TexBackend;
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
@@ -214,7 +222,10 @@ VkSampler vk_text_sampler(void);
 void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect);
 // Depth layout tracking (exec.c): on for depth targets made from now on; a tracked image being destroyed is forgotten.
 bool vk_depth_layouts(void);
+bool vk_color_layouts(void);  // (colour targets: SAVAGEWIND_VK_COLOR_LAYOUTS)
 void vk_dl_forget(TexBackend *b);
+void vk_dl_general(TexBackend *b);                                  // (outside a pass) a tracked image into GENERAL
+void vk_dl_upload(VkCommandBuffer upload_cb, TexBackend *b, bool before);  // around a CPU upload into b
 // Destruction once every submission that may use the object has completed.
 void vk_defer_image(VkImage img, VmaAllocation mem);
 void vk_defer_view(VkImageView v);

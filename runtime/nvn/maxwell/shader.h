@@ -99,6 +99,8 @@ typedef struct {
 #define GMEM2_BUFFER_INDEX 20       // (Vulkan) the heap past GMEM_SPLIT: a second binding
 #define GMEM_SPLIT 0x68000000ull    // bytes in the first binding; both stay under 2 GB for the whole heap (HEAP_MAX)
 #define GSNAP_BUFFER_INDEX 21       // (Vulkan, read-only global memory) ranges of it copied at translation: exec.c gsnap
+#define GMEMV_BUFFER_INDEX 22       // (Vulkan, compute, maxwell_gmem_mirror) the heap's copy in video memory, what GLD reads
+#define GMEMV2_BUFFER_INDEX 23      // ... its part past GMEM_SPLIT
 #define GATHER_BIAS_ID 100          // (Vulkan) the specialization constant glsl_gather moves its coordinates by (exec.c vk_gather_spec)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
 // Set by the Vulkan backend before translating: global memory in two bindings (maxStorageBufferRange below the heap),
@@ -107,6 +109,10 @@ extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
 // then a uniform buffer { uint64_t address, size } and every access is checked against that size. All change
 // translations.
 extern bool maxwell_gmem_split, maxwell_gmem_snap, maxwell_gmem_bda;
+// (Vulkan, compute shaders) global memory read from a copy of the heap in video memory (GMEMV_BUFFER_INDEX, exec.c
+// dispatch_compute brings the dispatch's storage buffers into it first) and written to both it and the heap: a discrete
+// GPU's reads of the imported heap cross PCIe. Set by the Vulkan backend before translating; part of the variant.
+extern bool maxwell_gmem_mirror;
 // Video > Wet grass fix (settings.h wet_fix), set by the Vulkan backend before translating. It changes the
 // translations of the game's wet lighting passes only (maxwell_wet_lighting), and is part of their ids
 // (shaders.c xlate_id), so each choice keeps its own cached translations of them.

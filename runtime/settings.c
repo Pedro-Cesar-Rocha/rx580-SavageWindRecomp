@@ -639,6 +639,9 @@ void settings_load(void) {
             g_settings.sharper_menus = !strcmp(val, "4x") ? 4 : !strcmp(val, "2x") ? 2 : 0;
         else if (!strcmp(key, "sharper_text"))  // (off / 2x / 4x)
             g_settings.sharper_text = !strcmp(val, "4x") ? 4 : !strcmp(val, "2x") ? 2 : 0;
+        else if (!strcmp(key, "effects_resolution"))  // (full / balanced / console)
+            g_settings.effects_res = !strcmp(val, "console") ? EFFRES_CONSOLE : !strcmp(val, "balanced") ? EFFRES_BALANCED
+                                   : EFFRES_FULL;
         else if (!strcmp(key, "shadow_resolution"))  // (console / high / ultra / extreme)
             g_settings.shadow_res = !strcmp(val, "extreme") ? SHADOW_EXTREME : !strcmp(val, "ultra") ? SHADOW_ULTRA
                                   : !strcmp(val, "high") ? SHADOW_HIGH : !strcmp(val, "potato") ? SHADOW_POTATO
@@ -820,6 +823,9 @@ void settings_save(void) {
     static const char *const shadow[SHADOW_COUNT] = {"console", "high", "ultra", "extreme", "potato"};
     int sr = g_settings.shadow_res;
     fprintf(f, "shadow_resolution = %s\n", shadow[sr >= 0 && sr < SHADOW_COUNT ? sr : SHADOW_CONSOLE]);
+    static const char *const effres[EFFRES_COUNT] = {"full", "balanced", "console"};
+    int er = g_settings.effects_res;
+    fprintf(f, "effects_resolution = %s\n", effres[er >= 0 && er < EFFRES_COUNT ? er : EFFRES_FULL]);
     fprintf(f, "sharper_menus = %s\n", g_settings.sharper_menus == 4 ? "4x" : g_settings.sharper_menus == 2 ? "2x" : "off");
     fprintf(f, "sharper_text = %s\n", g_settings.sharper_text == 4 ? "4x" : g_settings.sharper_text == 2 ? "2x" : "off");
     fprintf(f, "wide_view = %d\n", g_settings.wide_view);

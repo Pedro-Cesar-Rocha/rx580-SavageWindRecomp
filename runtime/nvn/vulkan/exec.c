@@ -1017,11 +1017,12 @@ void vk_translator_setup(void) {
     maxwell_gmem_split = maxwell_gmem_bda ? false : split ? atoi(split) != 0 : (g_vk.is_mali && HEAP_MAX > g_vk.props.limits.maxStorageBufferRange) ||
                                                     drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
     maxwell_gmem_snap = gsnap_mode() != 0;
-    {   // compute shaders read global memory from the heap copy in video memory (dispatch_compute): AMD's own driver on a
-        // discrete GPU by default; SAVAGEWIND_VK_GMEM_MIRROR=0 / 1 turns it off / on elsewhere
+    {   // compute shaders read global memory from the heap copy in video memory (dispatch_compute): off by default,
+        // SAVAGEWIND_VK_GMEM_MIRROR=1 turns it on. It was on with AMD's own driver, where its measured gain came from the
+        // particles it broke (dispatch_compute); made correct, it cost ~0.9 ms of GPU time a frame more than reading in
+        // place (RX 580, Hyrule Castle and Korok Forest: 92 -> 85 fps).
         const char *e = getenv("SAVAGEWIND_VK_GMEM_MIRROR");
-        bool discrete = g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
-        maxwell_gmem_mirror = !maxwell_gmem_bda && (e && *e ? atoi(e) != 0 : discrete && drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY);
+        maxwell_gmem_mirror = !maxwell_gmem_bda && e && *e && atoi(e) != 0;
         LOG("[vk] compute shaders' global memory reads: %s\n", maxwell_gmem_mirror ? "from the heap copy in video memory" : "in place");
     }
     // (the heap window too, from here on: translate_program and the precompile set it before translating, but the
@@ -9225,11 +9226,17 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     // it is now. BOTW's ~25 single-group dispatches a frame (particles: ~300 loads a thread, each a PCIe round trip from
     // the imported heap) took 1.2-1.5 ms of an RX 580's frame, 0.8 with this. Only with the copy as one buffer (8 GB
     // cards); otherwise the mirror's bindings name the heap itself.
-    VkBufferCopy gr[16];
+    // Its constant buffers too: the driver constants hold their addresses (cbuf_info, 0x210 on), and BOTW's particle
+    // shaders read their counts and parameters out of them as global memory. Only the storage buffers were brought in,
+    // and with the copy's stale constants the particle shaders left the particles as they were (stopping at a stale
+    // count): those of cut grass and flowers hung in the air until they faded. Of the GPU-written vertex data sampled at
+    // translation, ~3.5% had changed after the wait, ~38% read in place (SAVAGEWIND_VK_RACE_PROBE=1, cutting grass on the
+    // Great Plateau at 120 fps); the 1.2-1.5 -> 0.8 ms above was that work not done. Off by default since.
+    VkBufferCopy gr[34];
     int ngr = 0;
     if (maxwell_gmem_mirror && cp->si->uses_gmem && gmem_buf && hc_ready() && hc_state == 1 && hc_ch[0].buf && hc_size == gmem_size) {
-        for (int i = 0; i < 16; i++) {
-            Range r = st.sbuf[5][i];
+        for (int i = 0; i < 34; i++) {
+            Range r = i < 16 ? st.sbuf[5][i] : st.ubuf[5][i - 16];
             if (!r.addr || !r.size || r.addr < HEAP_BASE || r.addr + r.size > HEAP_BASE + gmem_size) continue;
             uint64_t lo = (r.addr - HEAP_BASE) & ~3ull, hi = (r.addr - HEAP_BASE + r.size + 3) & ~3ull;
             int k = 0;  // (sorted, merged)

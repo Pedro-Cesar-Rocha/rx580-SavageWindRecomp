@@ -43,6 +43,7 @@ struct KThread {
     int core_held;
     uint64_t core_ticket;
     bool off_cores;  // runs beside the cores, never holding one (kernel_thread_off_cores)
+    bool main_thread;  // the game's main thread (kernel_create_main_thread)
 };
 
 typedef struct KSharedMem {

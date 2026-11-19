@@ -13,6 +13,7 @@
 
 // ---- start / mode (exec.c vk_exec_init, before any command)
 void rec_init(void);
+void rec_cpus_changed(void);  // (game start, after plat_cpu_placement) the recorder's spin, by these processors
 bool rec_on(void);  // commands go through the recorder thread
 bool rec_on_recorder(void);  // the calling thread is the recorder (inside a rec_custom call): it must queue nothing
 

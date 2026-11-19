@@ -3426,6 +3426,7 @@ void backend_reset(void) {
     g_last_presented = NULL;
 }
 void backend_guest_memory_reset(void) {}  // (exec.c: the next SetHeapSize maps the heap again, or it is imported on first use)
+void backend_cpus_changed(void) { rec_cpus_changed(); }
 void backend_clear_window(void) {
     static const float black[4] = {0, 0, 0, 1};
     if (g_vk.dev && vk_frame_begin(black)) vk_frame_end(NULL);

@@ -404,7 +404,7 @@ void rt_unwind_point(void) {
 static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
-    if (t->id == 1) plat_thread_elevate();
+    if (t->main_thread) plat_thread_elevate();  // (thread ids start at 0x50: `t->id == 1` was never the main thread)
     {
         char pn[32];
         snprintf(pn, sizeof pn, "guest-%x", t->handle);
@@ -501,6 +501,7 @@ KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio
     region_add(stack, stack_size, 0xB, 3);
     KThread *t = thread_new(entry, 0, stack + stack_size, prio, 0);
     t->handle = kernel_new_handle(&t->obj);
+    t->main_thread = true;
     return t;
 }
 

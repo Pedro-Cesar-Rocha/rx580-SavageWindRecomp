@@ -130,6 +130,7 @@ __attribute__((section(".rst$z"), used)) static const ResetFn __stop_resets[1];
 
 void backend_reset(void);             // renderer: GPU idle, game textures and address-keyed caches dropped
 void backend_guest_memory_reset(void);  // renderer: guest memory was replaced (re-wrap the heap)
+void backend_cpus_changed(void);      // renderer: the game's processors are set (plat_cpu_placement)
 void backend_clear_window(void);      // a black frame while the game is down
 
 static void reboot_idle(void) {  // (main thread, while guest threads stop) keep the window alive
@@ -175,6 +176,7 @@ static void boot(const char *root) {
     { extern void language_booted(void); language_booted(); }  // (runtime/language.c)
     plat_cpu_placement();
     ksync_cpus_changed();  // (ksync.h: the waits' spin, by these processors)
+    backend_cpus_changed();  // (the Vulkan recorder's spin, the same way)
     kernel_init();
     dispatch_init();
     { extern void rupees_start(void); rupees_start(); }  // (Cheats > Infinite rupees, `rupees`: runtime/rupees.c)

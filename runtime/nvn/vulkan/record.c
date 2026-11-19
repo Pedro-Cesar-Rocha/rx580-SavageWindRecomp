@@ -157,9 +157,9 @@ static void *push(PktFn fn, size_t args, size_t extra) {
     SW_TALLY("vk packets");
     return h + 1;
 }
-static uint64_t publish_every = PUBLISH_EVERY;  // (rec_init: 64 KB where R doesn't spin)
+static _Atomic uint64_t publish_every = PUBLISH_EVERY;  // (spin_decide: 64 KB where R doesn't spin)
 static void commit(void) {
-    if (wpos - published >= publish_every) publish();
+    if (wpos - published >= atomic_load_explicit(&publish_every, memory_order_relaxed)) publish();
 }
 // (the arrays of a packet: after its arguments, 16-aligned)
 #define AL16(n) (((n) + 15) & ~(size_t)15)
@@ -167,10 +167,10 @@ static inline void *after(const void *args, size_t args_size) { return (uint8_t 
 
 // ---- the thread
 // R spins this long for the next packets before it sleeps: T hands it a few KB every 50-100 us while it translates
-// a list, and each of those finds R asleep otherwise, a wake-up syscall (~6 us on T, ~25 us before R runs). On CPUs
-// with fewer than 6 logical processors R sleeps at once, as before. SAVAGEWIND_VK_RECORDER_SPIN=<us> (0: never sleeps
-// late; default 60).
-static uint64_t spin_ns;
+// a list, and each of those finds R asleep otherwise, a wake-up syscall (~6 us on T, ~25 us before R runs). Where the
+// game runs on fewer than 6 logical processors R sleeps at once, as before (spin_decide).
+// SAVAGEWIND_VK_RECORDER_SPIN=<us> (0: never sleeps late; default 60).
+static _Atomic uint64_t spin_ns;
 #if defined(__x86_64__) || defined(__i386__)
 #define RELAX() __builtin_ia32_pause()
 #elif defined(__aarch64__)
@@ -178,13 +178,37 @@ static uint64_t spin_ns;
 #else
 #define RELAX() ((void)0)
 #endif
-static uint64_t spin_for_work(uint64_t t) {  // the published end once it moves past t, else t
+static uint64_t spin_for_work(uint64_t t, uint64_t ns) {  // the published end once it moves past t, else t
     uint64_t t0 = NOW(), h;
     for (unsigned i = 1;; i++) {
         if ((h = atomic_load_explicit(&head, memory_order_acquire)) != t) return h;
         RELAX();
-        if (!(i & 31) && NOW() - t0 > spin_ns) return t;
+        if (!(i & 31) && NOW() - t0 > ns) return t;
     }
+}
+
+// The spin and the publish size, by the logical processors the process runs on: at rec_init, and again once the game
+// has set them (rec_cpus_changed). The recorder starts with the window, before plat_cpu_placement: decided by all 8
+// logical processors of a 4-core CPU, it kept spinning where the game then ran on one per core (the recorder's CPU
+// 7-9 -> 2.3-3 ms a frame). RX 580 + i3-10105F, 1080p, three passes: Kakariko 101.2 -> 114.2 fps (1% lows 72 -> 90),
+// Hyrule Castle 106.2 -> 108.8, the Great Plateau 104.7 -> 107.7; the process's CPU 34-35 -> 29-30 ms a frame.
+static void spin_decide(void) {
+    const char *sp = getenv("SAVAGEWIND_VK_RECORDER_SPIN");
+    long us = sp ? atol(sp) : 60;
+    if (!sp && plat_cpu_count() < 6) us = 0;
+    uint64_t ns = us > 0 ? (uint64_t)us * 1000 : 0;
+    // Where R sleeps at once (no spin: fewer than 6 logical processors), each publish of 4 KB woke it, a syscall on T
+    // (6.7% of T's busy time, 4 cores, Rito): 64 KB there (RTX 3060 limited to 4 cores at 720p: Rito 102 -> 106 fps,
+    // castle 149 -> 153; 2 cores / 4 threads: Rito 76 -> 81, castle 105 -> 110). Submissions and waits still publish
+    // at once. With the spin, the same either way. SAVAGEWIND_VK_PUBLISH_KB=<KB> sets it.
+    uint64_t every = ns ? PUBLISH_EVERY : 64u << 10;
+    const char *kb = getenv("SAVAGEWIND_VK_PUBLISH_KB");
+    if (kb && atoi(kb) > 0) every = (uint64_t)atoi(kb) << 10;
+    atomic_store_explicit(&spin_ns, ns, memory_order_relaxed);
+    atomic_store_explicit(&publish_every, every, memory_order_relaxed);
+}
+void rec_cpus_changed(void) {
+    if (on >= 0) spin_decide();
 }
 
 static void *run(void *arg) {
@@ -199,7 +223,8 @@ static void *run(void *arg) {
     uint64_t t = 0;
     for (;;) {
         uint64_t h = atomic_load_explicit(&head, memory_order_acquire);
-        if (h == t && spin_ns && (h = spin_for_work(t)) != t) {
+        uint64_t sn = atomic_load_explicit(&spin_ns, memory_order_relaxed);
+        if (h == t && sn && (h = spin_for_work(t, sn)) != t) {
             // work came while spinning: no sleep, no wake-up syscall on T's side
         } else if (h == t) {
             pthread_mutex_lock(&mu);
@@ -227,19 +252,7 @@ void rec_init(void) {
     if (on >= 0) return;
     prof = getenv("SAVAGEWIND_VK_PROF") != NULL;
     prof_enq = prof && atoi(getenv("SAVAGEWIND_VK_PROF")) != 2;
-    {
-        const char *sp = getenv("SAVAGEWIND_VK_RECORDER_SPIN");
-        long us = sp ? atol(sp) : 60;
-        if (!sp && plat_cpu_count() < 6) us = 0;
-        spin_ns = us > 0 ? (uint64_t)us * 1000 : 0;
-    }
-    // Where R sleeps at once (no spin: fewer than 6 logical processors), each publish of 4 KB woke it, a syscall on T
-    // (6.7% of T's busy time, 4 cores, Rito): 64 KB there (RTX 3060 limited to 4 cores at 720p: Rito 102 -> 106 fps,
-    // castle 149 -> 153; 2 cores / 4 threads: Rito 76 -> 81, castle 105 -> 110). Submissions and waits still publish
-    // at once. With the spin, the same either way. SAVAGEWIND_VK_PUBLISH_KB=<KB> sets it.
-    if (!spin_ns) publish_every = 64u << 10;
-    if (getenv("SAVAGEWIND_VK_PUBLISH_KB") && atoi(getenv("SAVAGEWIND_VK_PUBLISH_KB")) > 0)
-        publish_every = (uint64_t)atoi(getenv("SAVAGEWIND_VK_PUBLISH_KB")) << 10;
+    spin_decide();
     const char *e = getenv("SAVAGEWIND_VK_RECORDER");
     int want = !e || atoi(e) != 0;
     // ARM's Mali drivers: LAS Recomp lost the GPU a few seconds into its title screen with the recorder thread on

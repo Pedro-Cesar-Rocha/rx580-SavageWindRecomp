@@ -592,6 +592,7 @@ void backend_reset(void) {
 }
 
 void backend_heap_set(uint64_t size) { (void)size; }  // (Vulkan on Linux maps GPU memory there)
+void backend_cpus_changed(void) {}
 
 void backend_guest_memory_reset(void) {
     if (!queue) return;

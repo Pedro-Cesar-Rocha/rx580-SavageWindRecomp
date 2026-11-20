@@ -11267,6 +11267,7 @@ static TexBackend *post_stencil(uint32_t w, uint32_t h) {
         VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
                                 .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
                                 .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT};
+        ci.mipLevels = vk_fast_levels(&ci);  // (post_image_ex: the fast layout; d.levels stays 1)
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         if (vmaCreateImage(g_vk.vma, &ci, &ai, &d.image, &d.mem, NULL) != VK_SUCCESS) {
             d.image = VK_NULL_HANDLE;
@@ -11351,6 +11352,9 @@ static TexBackend *post_image_ex(int i, uint32_t w, uint32_t h, VkFormat f, VkIm
                                 .format = f, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
                                 .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
                                 .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | extra};
+        // (a hidden second level: the fast layout on AMD's driver for a size not 256x128 aligned, as the game's targets
+        // get - SMAA's images at 2560x1440 were in the half-speed one; d->levels stays 1)
+        ci.mipLevels = vk_fast_levels(&ci);
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VkResult r = vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL);
         if (r != VK_SUCCESS) {

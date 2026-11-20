@@ -52,6 +52,7 @@ uint64_t vk_draw_total(void) { return draws_total; }  // (device.c boot_held: ho
 static uint64_t stat_gw_waits, stat_gw_holds;  // draws / dispatches that waited for a storing shader; lists held (gw_check)
 static uint64_t stat_uub, stat_uub_same, stat_gcopy_hit, stat_gcopy_miss, stat_gcopy_bytes;  // UpdateUniformBuffer; guest_copy cache
 static uint64_t stat_ubo_direct, stat_chain_barriers;  // constant buffers bound in place (ubo_direct)
+static uint64_t stat_dispatch_overlap;  // dispatches recorded without a barrier before them (dispatch_compute)
 static void ubo_check_done(bool report);
 static void vdyn_check(uint64_t seq);
 static void race_probe_check(uint64_t seq);
@@ -1313,9 +1314,24 @@ static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t al
 // the range it wrote: each copy keeps the update count it was made at and which written ranges it covers. (Copies used
 // to be shared within one GPU piece of ~300 draws and every UpdateUniformBuffer dropped them all: ~3000 copies, ~15 MB,
 // a frame in the open world.)
+// An entry is one cache line (it was 72 bytes, two lines for most entries): ~25,000 lookups a frame in the open world,
+// at random over a table bigger than the L2, were ~7 % of the render thread on 4 cores (the Great Plateau), mostly
+// waiting for the entry. stage_set also asks for the entries of a stage's constant buffers before it looks them up one
+// by one (guest_copy_prefetch), so their misses overlap.
 #define GCOPY_TAB 4096
 #define UUB_MAX 64
-static struct { uint64_t addr, size, gen, serial, mask; int chunk; VkSpan span; } gcopy[GCOPY_TAB];
+typedef struct {
+    uint64_t addr, gen, serial, mask;
+    VkSpan span;
+    uint32_t size;  // (copies of 4 GB and more are not kept)
+    int32_t chunk;
+} __attribute__((aligned(64))) GCopy;
+static GCopy gcopy[GCOPY_TAB];
+static inline uint32_t gcopy_slot(uint64_t addr, uint64_t size) {
+    uint64_t h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
+    return (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
+}
+static inline void guest_copy_prefetch(uint64_t addr, uint64_t size) { __builtin_prefetch(&gcopy[gcopy_slot(addr, size)]); }
 static uint64_t gcopy_gen = 1;
 static struct { uint64_t lo, hi, serial; } uubt[UUB_MAX];  // ranges UpdateUniformBuffer wrote, with the last update's count
 static int nuub;
@@ -1341,9 +1357,8 @@ static void uub_note(uint64_t lo, uint64_t hi) {
 }
 
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
-    uint64_t h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
-    uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
-    __typeof__(gcopy[0]) *e = &gcopy[slot];
+    if (size > UINT32_MAX) return vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
+    GCopy *e = &gcopy[gcopy_slot(addr, size)];
     uint64_t gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED);
     if (e->gen == gen && e->addr == addr && e->size == size) {
         bool stale = false;
@@ -1361,7 +1376,7 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     uint64_t mask = 0;
     for (int i = 0; i < nuub; i++)
         if (addr < uubt[i].hi && uubt[i].lo < addr + size) mask |= 1ull << i;
-    e->addr = addr; e->size = size; e->gen = gen; e->serial = uub_serial; e->mask = mask; e->chunk = active; e->span = s;
+    e->addr = addr; e->size = (uint32_t)size; e->gen = gen; e->serial = uub_serial; e->mask = mask; e->chunk = active; e->span = s;
     return s;
 }
 
@@ -1575,6 +1590,8 @@ const char *renderer_stats(void) {
         n = strlen(stats_text);
         if (stat_chain_barriers) snprintf(stats_text + n, sizeof stats_text - n, ", dispatch chain barriers %llu", (unsigned long long)stat_chain_barriers);
         n = strlen(stats_text);
+        if (stat_dispatch_overlap) snprintf(stats_text + n, sizeof stats_text - n, " (%llu left out)", (unsigned long long)stat_dispatch_overlap);
+        n = strlen(stats_text);
         if (stat_build_waits) snprintf(stats_text + n, sizeof stats_text - n, ", build waits %llu", (unsigned long long)stat_build_waits);
         stat_build_waits = 0;
         n = strlen(stats_text);
@@ -1589,7 +1606,7 @@ const char *renderer_stats(void) {
                      (unsigned long long)stat_dl_trans, (unsigned long long)stat_dl_restarts, (unsigned long long)stat_dl_general,
                      dl_nout);
         stat_dl_trans = stat_dl_restarts = stat_dl_general = 0;
-        stat_uub = stat_uub_same = stat_gcopy_hit = stat_gcopy_miss = stat_gcopy_bytes = stat_ubo_direct = stat_chain_barriers = 0;
+        stat_uub = stat_uub_same = stat_gcopy_hit = stat_gcopy_miss = stat_gcopy_bytes = stat_ubo_direct = stat_chain_barriers = stat_dispatch_overlap = 0;
         ubo_check_done(true);
         stat_gw_waits = stat_gw_holds = 0;
         stat_sets = stat_sets_reused = 0;
@@ -6193,6 +6210,14 @@ static bool fxaa_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out
     return true;
 }
 
+// The bytes of game constant buffer k (3 on) bound at r that a stage copies (cbuf_info)
+static uint64_t cbuf_copy_size(const ShaderInfo *si, int k, Range r) {
+    uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
+    if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
+    if (size > r.size && r.size) size = r.size;
+    return size < 16 ? 16 : size;
+}
+
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
@@ -6240,9 +6265,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
     uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
     if (!r.addr) return ubo_span(vk_transient_copy(zeros, size, 256), size);
-    if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
-    if (size > r.size && r.size) size = r.size;
-    if (size < 16) size = 16;
+    size = cbuf_copy_size(si, k, r);
     // An address outside the game's memory ended the game in the copy below after two hours of play (#640: 0x5000000000
     // on the render thread). Read as an unbound buffer, and logged: where the address comes from is still unknown.
     if (r.addr < GUEST_LO || r.addr >= GUEST_HI || size > GUEST_HI - r.addr) {
@@ -7955,6 +7978,40 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
 // render thread at Rito). Not for depth-compare textures (their shadow copies and depth twins come and go within a
 // frame), nor while this draw has feedback copies or a scene composite in play; a view that may have been destroyed
 // bumps vk_view_gen, which drops them all. SAVAGEWIND_VK_NO_TEX_MEMO=1: off, with the view memo.
+typedef struct {
+    uint64_t h, frame;
+    const void *tpool, *spool, *tex;
+    NvnTextureView view;
+    uint8_t has_view;
+    uint32_t gen;
+    uint8_t type, stage, blend, valid;
+    float bias, sc[2];
+    uint32_t wh[2];
+    VkDescriptorImageInfo ii;
+} TexMemo;
+static TexMemo tex_memo[2048];
+static inline uint32_t tex_memo_slot(uint64_t h, uint32_t type, int stage, uint8_t blend) {
+    return (uint32_t)((h * 0x9E3779B97F4A7C15ull ^ (uint64_t)type << 3 ^ (uint64_t)stage << 7 ^ blend) >> 53) & 2047;
+}
+
+// The memo entries and the texture pool entries of a stage's textures, asked for before texture_info looks them up one
+// by one (draws read ~2400 a frame in the open world, from tables bigger than the L2: their misses now overlap)
+static void texture_prefetch(int stage, const ShaderInfo *si) {
+    if (!st.tpool || stage < 0 || stage > 5) return;
+    uint8_t blend = st.color_state[0] & 1;
+    for (int i = 0; i < si->ntex && i < 64; i++) {
+        const ShaderTexture *st_ = &si->tex[i];
+        int slot = ((int)st_->handle_offset - 0x20) / 8;
+        uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+        uint32_t tic = h & 0xFFFFF;
+        if (!h || tic >= (uint32_t)st.tpool->count) continue;
+        __builtin_prefetch(&((NvnTexEntry *)st.tpool->entries)[tic]);
+        const char *m = (const char *)&tex_memo[tex_memo_slot(h, st_->type, stage, blend)];
+        __builtin_prefetch(m);
+        __builtin_prefetch(m + sizeof(TexMemo) - 1);
+    }
+}
+
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;
@@ -7970,22 +8027,10 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
         texture_info_(stage, si, i, out, sc, wh);
         return;
     }
-    static struct {
-        uint64_t h, frame;
-        const void *tpool, *spool, *tex;
-        NvnTextureView view;
-        uint8_t has_view;
-        uint32_t gen;
-        uint8_t type, stage, blend, valid;
-        float bias, sc[2];
-        uint32_t wh[2];
-        VkDescriptorImageInfo ii;
-    } m[2048];
     uint8_t blend = st.color_state[0] & 1;
     float bias = stage == 1 && pass_mvec >= 0 && rt_jitter_on() ? scene_mip_bias : 0;  // (the material bias, if it is one)
     uint64_t frame = vk_frame_counter();
-    uint32_t k = (uint32_t)((h * 0x9E3779B97F4A7C15ull ^ (uint64_t)st_->type << 3 ^ (uint64_t)stage << 7 ^ blend) >> 53) & 2047;
-    __typeof__(m[0]) *e = &m[k];
+    TexMemo *e = &tex_memo[tex_memo_slot(h, st_->type, stage, blend)];
     if (e->valid && e->h == h && e->frame == frame && e->gen == vk_view_gen && e->tpool == st.tpool && e->spool == st.spool &&
         e->type == st_->type && e->stage == stage && e->blend == blend && e->bias == bias && e->tex == te->tex &&
         e->has_view == te->has_view && (!te->has_view || !memcmp(&e->view, &te->view, sizeof te->view))) {
@@ -7994,7 +8039,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
         return;
     }
     texture_info_(stage, si, i, out, sc, wh);
-    *e = (__typeof__(*e)){.h = h, .frame = frame, .tpool = st.tpool, .spool = st.spool, .tex = te->tex, .view = te->view,
+    *e = (TexMemo){.h = h, .frame = frame, .tpool = st.tpool, .spool = st.spool, .tex = te->tex, .view = te->view,
                           .has_view = te->has_view, .gen = vk_view_gen, .type = (uint8_t)st_->type,
                           .stage = (uint8_t)stage, .blend = blend, .valid = 1, .bias = bias, .sc = {sc[0], sc[1]},
                           .wh = {wh[0], wh[1]}, .ii = *out};
@@ -8464,6 +8509,15 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     }
     if (gmem_sparse && si->writes_gmem) (void)gmem_info();
 #endif
+    if (stage == 5 && si->ntex) texture_prefetch(stage, si);  // (a draw's: draw_, before resolve_feedback)
+    for (int i = 0; i < p->nbinds && stage >= 0 && stage < 6; i++) {  // (guest_copy_prefetch: its constant buffers' entries)
+        const VkBindingInfo *b = &p->binds[i];
+        if (b->set != set || b->binding < 3 || b->binding >= 17 ||
+            (b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC))
+            continue;
+        Range r = st.ubuf[stage][b->binding - 3];
+        if (r.addr) guest_copy_prefetch(r.addr, cbuf_copy_size(si, (int)b->binding, r));
+    }
     struct { uint32_t binding, off; } dv[32];
     int nd = 0;
     VkWriteDescriptorSet w[MAX_BIND];
@@ -9176,6 +9230,65 @@ bool vk_pso_wait(int ms, float *done) {
     return !atomic_load(&pso_running);
 }
 
+// ---- dispatches side by side
+// Single-group dispatches in a row (BOTW's particles: one per emitter, 25 to 70 a frame in the open world) each read
+// their emitter's parameters, ~300 loads a thread, from the game's memory: across PCIe on a discrete GPU, 40-90 us a
+// dispatch. With a barrier between each and the next they ran one at a time: 69 at Hyrule Castle, 3.4 ms of an RX 580's
+// frame. Most of them share nothing (each emitter's arrays are storage buffers of its own), so a dispatch now waits for
+// the ones since the last barrier only where it must: where what it can reach (the storage and constant buffers whose
+// addresses it reads from its driver constants, c0 0x310 + 16 i and 0x210 + 16 i: ShaderInfo cbuf_rows; a slot it never
+// reads the address of is one it can't reach - BOTW leaves an emitter's buffer bound in a slot the others don't use)
+// meets what they may have written (a storing shader's storage buffers, as gw_note takes them), or what it may write
+// meets what they can reach. A storing shader without storage buffers, or with images, waits as before.
+// SAVAGEWIND_VK_DISPATCH_OVERLAP=0: a barrier between every two.
+#define DOV_MAX 64
+typedef struct { uint64_t lo, hi; } DovRange;
+static DovRange dov_w[DOV_MAX], dov_r[DOV_MAX];  // what the dispatches since the last barrier may write / can reach
+static int dov_nw, dov_nr;
+static bool dov_unknown;  // (one of them could not tell)
+
+static bool dispatch_overlap_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SAVAGEWIND_VK_DISPATCH_OVERLAP");
+        on = (!e || atoi(e)) && !maxwell_gmem_mirror;  // (the mirror's copies go between dispatches)
+    }
+    return on;
+}
+
+static bool cs_reads_driver_row(const ShaderInfo *si, int row) {
+    return (si->cbuf_rows_all & 1) || ((si->cbuf_rows[0][row >> 6] >> (row & 63)) & 1);
+}
+
+// What a dispatch of cp can reach (rd: up to 34) and may write (wr: up to 16) with the bindings as they are; false:
+// it can't be told
+static bool dispatch_ranges(const CsProg *cp, DovRange *rd, int *nrd, DovRange *wr, int *nwr) {
+    const ShaderInfo *si = cp->si;
+    *nrd = *nwr = 0;
+    for (int i = 0; i < si->ntex; i++)
+        if (si->tex[i].is_image) return false;
+    for (int i = 0; i < 16; i++) {
+        Range r = st.sbuf[5][i];
+        if (!r.addr || !r.size || !cs_reads_driver_row(si, 49 + i)) continue;
+        rd[(*nrd)++] = (DovRange){r.addr, r.addr + r.size};
+        if (si->writes_gmem) wr[(*nwr)++] = (DovRange){r.addr, r.addr + r.size};
+    }
+    if (si->writes_gmem && !*nwr) return false;
+    for (int i = 0; i < 18; i++) {
+        Range r = st.ubuf[5][i];
+        if (!r.addr || !cs_reads_driver_row(si, 33 + i)) continue;
+        rd[(*nrd)++] = (DovRange){r.addr, r.addr + (r.size ? r.size : 0x10000)};
+    }
+    return true;
+}
+
+static bool dov_meet(const DovRange *a, int na, const DovRange *b, int nb) {
+    for (int i = 0; i < na; i++)
+        for (int j = 0; j < nb; j++)
+            if (a[i].lo < b[j].hi && b[j].lo < a[i].hi) return true;
+    return false;
+}
+
 static void wait_built(_Atomic int *state);
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
@@ -9195,16 +9308,32 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     // the full barrier.
     static int chain = -1;
     if (chain < 0) chain = !getenv("SAVAGEWIND_VK_DISPATCH_CHAIN") || atoi(getenv("SAVAGEWIND_VK_DISPATCH_CHAIN"));
-    if (chain && after_dispatch) {
-        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                               .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                               .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT};
-        rec_CmdPipelineBarrier2(cb, &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
-                                                        .pMemoryBarriers = &mb});
-        stat_chain_barriers++;
+    // (dispatches side by side, above) a dispatch the ones since the last barrier can't affect, nor it them, goes without one
+    DovRange rd[34], wr[16];
+    int nrd = 0, nwr = 0;
+    bool known = dispatch_overlap_on() && dispatch_ranges(cp, rd, &nrd, wr, &nwr);
+    if (chain && after_dispatch && known && !dov_unknown && dov_nw + nwr <= DOV_MAX && dov_nr + nrd <= DOV_MAX &&
+        !dov_meet(dov_w, dov_nw, rd, nrd) && !dov_meet(dov_r, dov_nr, wr, nwr)) {
+        stat_dispatch_overlap++;
     } else {
-        vk_full_barrier(cb);
+        if (chain && after_dispatch) {
+            VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                   .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                   .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT};
+            rec_CmdPipelineBarrier2(cb, &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                                            .pMemoryBarriers = &mb});
+            stat_chain_barriers++;
+        } else {
+            vk_full_barrier(cb);
+        }
+        dov_nw = dov_nr = 0;
+        dov_unknown = false;
     }
+    memcpy(dov_w + dov_nw, wr, (size_t)nwr * sizeof *wr);
+    memcpy(dov_r + dov_nr, rd, (size_t)nrd * sizeof *rd);
+    dov_nw += nwr;
+    dov_nr += nrd;
+    dov_unknown |= !known;
     gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u)", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2]);
     ck_mark(cb, "dispatch", gx, gy, gz, 0, 0, st.program->stages[5].code_addr);
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
@@ -9215,7 +9344,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
             (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem, cp->si->cbuf_mask);
         for (int i = 0; i < 16; i++)
             if (st.sbuf[5][i].addr) LOG(" %d=%llx+%llu", i, (unsigned long long)st.sbuf[5][i].addr, (unsigned long long)st.sbuf[5][i].size);
-        LOG("\n");
+        LOG(" ubuf:");
+        for (int i = 0; i < 18; i++)
+            if (st.ubuf[5][i].addr) LOG(" %d=%llx+%llu", i, (unsigned long long)st.ubuf[5][i].addr, (unsigned long long)st.ubuf[5][i].size);
+        LOG(" writes %d\n", cp->si->writes_gmem);
     }
     nfeedback = 0;
     memset(feedback_be, 0, sizeof feedback_be);
@@ -9757,6 +9889,8 @@ static void draw_(CmdRec *r, bool indexed) {
         if (in_pass && !st.rt_dirty && pass_frag_only) { st.rt_dirty = true; stat_frag_restarts++; }
         pass_vs_reads_next = true;  // (whichever pass begins next, also one resolve_feedback starts: a full barrier)
     }
+    texture_prefetch(0, pr->vi);  // (resolve_feedback and texture_info read their texture pool entries)
+    texture_prefetch(1, pr->fi);
     resolve_feedback(pr);
     det_draw = 0;
     if (profd) {

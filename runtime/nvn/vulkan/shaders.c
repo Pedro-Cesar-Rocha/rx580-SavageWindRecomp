@@ -1254,6 +1254,36 @@ static const char *builtin_src(const char *name, int *stage) {
         }
         return src[k];
     }
+    // present.frag with SMAA's neighbourhood blending (exec.c vk_present_draw: the picture drawn 1:1, its blending
+    // done here instead of in a pass of its own): t = colour, t1 = SMAA's weights; SMAA_RT_METRICS after the vertex
+    // shader's 32 bytes. uv comes from present.vert (its flip and crop), the pixel centres at 1:1.
+    if (!strcmp(name, "present_smaa.frag")) {
+        *stage = STAGE_FRAGMENT;
+        static char *s;
+        if (!s) {
+            extern const char smaa_hlsl_src[];
+            static const char *head =
+                "#version 450\n"
+                "layout(push_constant) uniform P { layout(offset = 32) vec4 a; } pc;\n"
+                "#define SMAA_RT_METRICS pc.a\n"
+                "#define SMAA_GLSL_4\n"
+                "#define SMAA_PRESET_HIGH\n";
+            static const char *main_ =
+                "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+                "layout(set = 0, binding = 1) uniform sampler2D t1;\n"
+                "layout(location = 0) in vec2 uv;\n"
+                "layout(location = 0) out vec4 o;\n"
+                "void main() {\n"
+                "  vec4 off;\n"
+                "  SMAANeighborhoodBlendingVS(uv, off);\n"
+                "  o = vec4(SMAANeighborhoodBlendingPS(uv, off, t, t1).rgb, 1.0);\n"
+                "}\n";
+            size_t n = strlen(head) + strlen(smaa_hlsl_src) + strlen(main_) + 1;
+            s = malloc(n);
+            snprintf(s, n, "%s%s%s", head, smaa_hlsl_src, main_);
+        }
+        return s;
+    }
     // AMD FidelityFX Super Resolution 1 (MIT), EASU: edge-adaptive upscale. a = (in / out scale xy, offset zw),
     // b.xy = input size (alpha: bilinear, for the 3D scene's composite, exec.c scene_upscale). 12 taps around the source pixel, direction / edge length from luma, Lanczos-2-like
     // weights stretched along the edge, clamped to the nearest 4 (no ringing). b.z = 1: the input is linear (BOTW's

@@ -4,14 +4,15 @@
 runtime (`runtime/`), never the generated game library, and holds execution counters keyed by function names
 (`file.c:function`): no game data, no paths.
 
-This fork's profile (RX580.7) was made with clang 23.1.5 (MSYS2 UCRT64) from the RX580.7 sources. One training run of
+This fork's profile (RX580.9) was made with clang 23.1.5 (MSYS2 UCRT64) from the RX580.9 sources. One training run of
 the instrumented build (`make PGO=gen`): `tools/perf_routes.py run` over the kakariko, field, castle and hateno routes
-(and part of korok) at 1920x1080 with SMAA, effects at full resolution and shadows at console resolution, on an RX 580
-8 GB with AMD's own driver and an i3-10105F: the AMD and 4-core paths these builds are played with. The profile it
-replaced (clang 23.1.4, upstream `test` at 04aa642, TAA and high shadows) had gone stale for most of the render thread's
-functions, edited since. RX580.6 (the old profile) against RX580.7 (this one, with that release's other changes) on
-the Great Plateau, which is not in the training: render thread 9.16 -> 8.32 ms a frame, 106.1 -> 115.0 fps (two
-interleaved passes). The file is about 860 KB; its size follows the number of counters in the code, not the play time.
+at 2560x1440 with SMAA, effects at full resolution and shadows at console resolution, on an RX 580 8 GB with AMD's own
+driver and an i3-10105F: the AMD and 4-core paths these builds are played with. It replaced RX580.7's (the same
+routes at 1920x1080), stale for the draw path RX580.9 edited. RX580.7's had replaced one from clang 23.1.4 (upstream
+`test` at 04aa642, TAA and high shadows), stale for most of the render thread's functions: RX580.6 (that one) against
+RX580.7 (the new one, with that release's other changes) on the Great Plateau, which is not in the training: render
+thread 9.16 -> 8.32 ms a frame, 106.1 -> 115.0 fps (two interleaved passes). The file is about 860 KB; its size
+follows the number of counters in the code, not the play time.
 
 The upstream profile, as measured upstream:
 

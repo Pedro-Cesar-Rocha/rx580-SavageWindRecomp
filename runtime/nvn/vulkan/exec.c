@@ -53,6 +53,7 @@ static uint64_t stat_gw_waits, stat_gw_holds;  // draws / dispatches that waited
 static uint64_t stat_uub, stat_uub_same, stat_gcopy_hit, stat_gcopy_miss, stat_gcopy_bytes;  // UpdateUniformBuffer; guest_copy cache
 static uint64_t stat_ubo_direct, stat_chain_barriers;  // constant buffers bound in place (ubo_direct)
 static uint64_t stat_dispatch_overlap;  // dispatches recorded without a barrier before them (dispatch_compute)
+static uint64_t stat_dispatch_after_pass;  // ... of them right after passes
 static void ubo_check_done(bool report);
 static void vdyn_check(uint64_t seq);
 static void race_probe_check(uint64_t seq);
@@ -331,14 +332,15 @@ static bool draw_rd_unknown;  // ... not all of it known
 static bool el_for_draw;      // begin_pass runs for a draw (draw_rd is its reads), not for a clear
 static uint32_t draw_rd_gen = 1, el_noted_gen;  // draw_rd's version; the one el_r holds (0: none since the barrier)
 static uint64_t stat_elided, stat_el_passes, stat_el_restarts;
-static void el_reset(void) { el_nw = el_nr = 0; el_full = false; el_noted_gen = 0; }  // (a barrier: all before it done)
+static bool el_w_full;        // ... and el_w is not all the passes drew into (dispatch_samples_clear)
+static void el_reset(void) { el_nw = el_nr = 0; el_full = el_w_full = false; el_noted_gen = 0; }  // (a barrier: all before it done)
 static bool el_overlap(const SubRange *a, const SubRange *b) {
     return a->img == b->img && a->l0 < b->l1 && b->l0 < a->l1 && a->y0 < b->y1 && b->y0 < a->y1;
 }
 static void el_add(SubRange *l, int *n, int cap, SubRange r) {
     for (int i = 0; i < *n; i++)
         if (l[i].img == r.img && l[i].l0 == r.l0 && l[i].l1 == r.l1 && l[i].y0 == r.y0 && l[i].y1 == r.y1) { l[i].pass = r.pass; return; }
-    if (*n == cap) { el_full = true; return; }
+    if (*n == cap) { el_full = true; el_w_full |= l == el_w; return; }
     l[(*n)++] = r;
 }
 static void el_note_reads(void) {  // (the draw's samples, for the next passes' write-after-read checks)
@@ -355,9 +357,29 @@ static void el_note_reads(void) {  // (the draw's samples, for the next passes' 
 // reads (vertex data, instance data a compute shader culled): the next pass begins behind a full barrier then.
 static bool vtx_hazard = true;
 static bool after_dispatch;  // nothing recorded since the last dispatch but its own commands (dispatch_compute)
+static bool after_pass;      // since the last full barrier or dispatch, passes begun and nothing else (dispatch_compute)
+static bool pass_live;       // a pass begun since the last full barrier: compute work after it is not ordered after it
+static bool pass_wrote;      // ... one whose draws stored to the game's memory, or with a linear target (copied to it)
+// (dispatches side by side, dispatch_compute) what the dispatches since the last barrier may write / can reach
+#define DOV_MAX 64
+typedef struct { uint64_t lo, hi; } DovRange;
+static DovRange dov_w[DOV_MAX], dov_r[DOV_MAX];
+static int dov_nw, dov_nr;
+static bool dov_unknown;  // (one of them could not tell)
+// (a dispatch after passes, dispatch_compute) the game's memory the draws since the last full barrier may read in
+// place: vertices, indices, constant buffers (pr_note_draw)
+#define PR_MAX 256
+static DovRange pr_rd[PR_MAX];
+static int pr_n;
+static bool pr_unknown;  // (a draw that could not tell, or no room)
+static uint64_t pr_vgen, pr_ugen[2];  // (the vertex / constant buffers last noted: vbuf_gen, ubuf_gen)
+static uint32_t pr_umask[2], pr_gwgen;
 void vk_full_barrier(VkCommandBuffer cb) {
     vtx_hazard = true;  // (begin_pass clears it after its own)
-    after_dispatch = false;
+    after_dispatch = after_pass = pass_live = pass_wrote = false;
+    dov_nw = dov_nr = pr_n = 0;  // (all before it done)
+    dov_unknown = pr_unknown = false;
+    pr_vgen = pr_ugen[0] = pr_ugen[1] = 0;
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
@@ -1590,7 +1612,7 @@ const char *renderer_stats(void) {
         n = strlen(stats_text);
         if (stat_chain_barriers) snprintf(stats_text + n, sizeof stats_text - n, ", dispatch chain barriers %llu", (unsigned long long)stat_chain_barriers);
         n = strlen(stats_text);
-        if (stat_dispatch_overlap) snprintf(stats_text + n, sizeof stats_text - n, " (%llu left out)", (unsigned long long)stat_dispatch_overlap);
+        if (stat_dispatch_overlap) snprintf(stats_text + n, sizeof stats_text - n, " (%llu left out, %llu after passes)", (unsigned long long)stat_dispatch_overlap, (unsigned long long)stat_dispatch_after_pass);
         n = strlen(stats_text);
         if (stat_build_waits) snprintf(stats_text + n, sizeof stats_text - n, ", build waits %llu", (unsigned long long)stat_build_waits);
         stat_build_waits = 0;
@@ -1606,7 +1628,7 @@ const char *renderer_stats(void) {
                      (unsigned long long)stat_dl_trans, (unsigned long long)stat_dl_restarts, (unsigned long long)stat_dl_general,
                      dl_nout);
         stat_dl_trans = stat_dl_restarts = stat_dl_general = 0;
-        stat_uub = stat_uub_same = stat_gcopy_hit = stat_gcopy_miss = stat_gcopy_bytes = stat_ubo_direct = stat_chain_barriers = stat_dispatch_overlap = 0;
+        stat_uub = stat_uub_same = stat_gcopy_hit = stat_gcopy_miss = stat_gcopy_bytes = stat_ubo_direct = stat_chain_barriers = stat_dispatch_overlap = stat_dispatch_after_pass = 0;
         ubo_check_done(true);
         stat_gw_waits = stat_gw_holds = 0;
         stat_sets = stat_sets_reused = 0;
@@ -2626,6 +2648,7 @@ typedef struct {
     VkImageView view[2];  // 2D, 2D array
     uint32_t w, h, layers;
     VkFormat fmt;
+    uint64_t seq;  // (the submission it was last copied in: depth_twin_update)
 } DepthTwin;
 static DepthTwin depth_twins[8];
 static unsigned depth_twin_next;
@@ -2659,6 +2682,12 @@ static DepthTwin *depth_twin_update(VkCommandBuffer cb, TexBackend *b) {
     uint32_t bpp = df == VK_FORMAT_D32_SFLOAT ? 4 : 2, layers = b->layers ? b->layers : 1;
     uint64_t bytes = (uint64_t)b->width * b->height * layers * bpp;
     if (bytes > (64u << 20)) return NULL;
+    // A source only uploads write (not GPU-owned: an upload goes into the submission's upload buffer, which runs before
+    // its main one) has the same contents all through a submission: copied once in it. BOTW's particle compute shaders
+    // get a 4x4 R32_SFLOAT array in their shadow slot, and it was copied before each of them, ~25 times a frame at Hyrule
+    // Castle, each copy behind a barrier that waits for all the GPU has before it: no two of those dispatches overlapped.
+    DepthTwin *had = depth_twin_find(b);
+    if (had && !b->gpu_owned && had->seq == vk_pending_seq()) return had;
     // one staging buffer for every copy, grow-only (one it replaces may still be in use by the pending submission: it
     // stays allocated, a few times at most)
     static VkBuffer buf;
@@ -2732,6 +2761,7 @@ static DepthTwin *depth_twin_update(VkCommandBuffer cb, TexBackend *b) {
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo d2 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &m2};
     rec_CmdPipelineBarrier2(cb, &d2);  // (the twin for its readers; the buffer and the source for later writes)
+    t->seq = vk_pending_seq();
     return t;
 }
 
@@ -2831,7 +2861,7 @@ static void vk_end_pass_at(int line) {
     for (int i = 0; i < pass_nblock; i++) vk_block_flush(vk_cmd(), pass_block[i]);
     pass_nblock = 0;
     depth_twin_after_pass(vk_cmd());  // (the shadow copy just drawn: its depth twin)
-    if (pass_nlinear) bar_other = true;  // (copies to memory)
+    if (pass_nlinear) bar_other = pass_wrote = true;  // (copies to memory)
     for (int i = 0; i < pass_nlinear; i++) readback_schedule(vk_cmd(), pass_linear[i], &pass_linear_view[i], pass_linear_has_view[i]);
     pass_nlinear = 0;
     // (debug frame) what the pass drew: its targets, as begin_pass recorded them (st.rt may name the next pass's)
@@ -2887,7 +2917,7 @@ static bool el_on(void) {  // (pass barriers left out: el_w above)
     if (tf && renderer_present_count() != tfr) {
         tfr = renderer_present_count();
         FILE *f = fopen(tf, "rb");
-        if (toff != (f != NULL)) el_full = true;  // (what the lists missed while off: the next pass has its barrier)
+        if (toff != (f != NULL)) el_full = el_w_full = true;  // (what the lists missed while off: the next pass has its barrier)
         toff = f != NULL;
         if (f) fclose(f);
     }
@@ -3003,6 +3033,7 @@ static void begin_pass(void) {
         VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
         rec_CmdPipelineBarrier2(cb, &di);
         el_reset();
+        el_w_full = true;  // (fragment work only waited: what passes before drew is not for compute work, dispatch_samples_clear)
         pass_elided = false;
     } else {
         // (el_w above) no barrier where this pass's targets are none of what passes since the last one drew into or
@@ -3035,6 +3066,7 @@ static void begin_pass(void) {
         }
     }
     el_pass++;
+    after_pass = pass_live = true;
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -3266,7 +3298,7 @@ static void begin_pass(void) {
     if (el_on()) {  // (el_w: the images as the views made them)
         SubRange att[10];
         int natt = el_targets(att);
-        if (natt < 0) el_full = true;
+        if (natt < 0) el_full = el_w_full = true;
         for (int i = 0; i < natt; i++) el_add(el_w, &el_nw, EL_W, att[i]);
         el_note_reads();
     }
@@ -7166,6 +7198,49 @@ static bool gw_ubo_copied(int stage, uint32_t cbuf_mask) {  // a constant buffer
     return false;
 }
 
+// (a dispatch after passes, dispatch_compute) What of the game's memory a draw may read in place, into pr_rd: its
+// vertex and index buffers (whether read in place, from the heap copy or copied), and the constant buffers its stages
+// read that are bound in place - one in the set (gw_ubo_direct), or any with ubo_direct on. What the copies hold, no
+// dispatch writes. A draw that reads global memory, or has geometry or tessellation stages, can't tell.
+static void pr_add(uint64_t lo, uint64_t hi) {
+    if (pr_n && pr_rd[pr_n - 1].lo <= hi && lo <= pr_rd[pr_n - 1].hi) {  // (the last one's neighbour: the same buffer)
+        if (lo < pr_rd[pr_n - 1].lo) pr_rd[pr_n - 1].lo = lo;
+        if (hi > pr_rd[pr_n - 1].hi) pr_rd[pr_n - 1].hi = hi;
+    } else if (pr_n < PR_MAX) {
+        pr_rd[pr_n++] = (DovRange){lo, hi};
+    } else {
+        pr_unknown = true;
+    }
+}
+
+static void pr_note_draw(const Prog *pr, uint64_t iaddr, uint64_t isize) {
+    if (pr_unknown) return;
+    if (pr->vi->uses_gmem || pr->fi->uses_gmem || (st.program->stage_mask & 0x1c)) { pr_unknown = true; return; }
+    if (pr_vgen != vbuf_gen) {
+        pr_vgen = vbuf_gen;
+        for (int i = 0; i < 16; i++) {
+            Range v = st.vbuf[i];
+            if (!v.addr) continue;
+            if (!v.size) { pr_unknown = true; return; }
+            pr_add(v.addr, v.addr + v.size);
+        }
+    }
+    if (iaddr) pr_add(iaddr, iaddr + isize);
+    for (int s = 0; s < 2; s++) {
+        uint32_t m = (s ? pr->fi : pr->vi)->cbuf_mask >> 3;  // (cbuf k is bound slot k - 3)
+        if (!m || (pr_ugen[s] == ubuf_gen[s] && pr_umask[s] == m && pr_gwgen == gw_gen)) continue;
+        pr_ugen[s] = ubuf_gen[s], pr_umask[s] = m;
+        for (; m; m &= m - 1) {
+            int i = __builtin_ctz(m);
+            if (i >= 18) break;
+            Range u = st.ubuf[s][i];
+            uint64_t size = u.size ? (u.size > 0x10000 ? 0x10000 : u.size) : 0x10000;
+            if (u.addr && (ubo_direct_on != 0 || gw_overlaps(u.addr, u.addr + size))) pr_add(u.addr, u.addr + size);
+        }
+    }
+    pr_gwgen = gw_gen;
+}
+
 // Before a draw's or dispatch's copies (and before its pass begins): copies of memory in the set wait for the GPU.
 // cbufs[stage]: the constant buffers each stage reads (ShaderInfo.cbuf_mask; 0: none).
 static void gw_check(const uint32_t cbufs[6], bool vertices, uint64_t iaddr, uint64_t isize) {
@@ -9241,17 +9316,31 @@ bool vk_pso_wait(int ms, float *done) {
 // meets what they may have written (a storing shader's storage buffers, as gw_note takes them), or what it may write
 // meets what they can reach. A storing shader without storage buffers, or with images, waits as before.
 // SAVAGEWIND_VK_DISPATCH_OVERLAP=0: a barrier between every two.
-#define DOV_MAX 64
-typedef struct { uint64_t lo, hi; } DovRange;
-static DovRange dov_w[DOV_MAX], dov_r[DOV_MAX];  // what the dispatches since the last barrier may write / can reach
-static int dov_nw, dov_nr;
-static bool dov_unknown;  // (one of them could not tell)
-
 static bool dispatch_overlap_on(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("SAVAGEWIND_VK_DISPATCH_OVERLAP");
         on = (!e || atoi(e)) && !maxwell_gmem_mirror;  // (the mirror's copies go between dispatches)
+    }
+    return on;
+}
+
+// ---- a dispatch after passes
+// Where BOTW draws the particles of an emitter right after updating it (Hyrule Castle: ~20 times a frame dispatch,
+// a pass of 26-60 particle draws, dispatch, pass...), each dispatch began behind a full barrier: it waited for the pass
+// before it to finish, and the pass for the dispatch, the GPU on one of them at a time (RX 580, 1440p: ~10% of the
+// castle's frame). The barrier is for what the passes since the last full one wrote and the dispatch reads, or read
+// and it writes. Both are known: they wrote only their targets (el_w; a draw that stores to memory or a linear target
+// sets pass_wrote), and their draws read in place only their vertex, index and constant buffers (pr_note_draw). So a
+// dispatch of known reach (dispatch_ranges) that samples nothing they drew into (dispatch_samples_clear) and writes
+// nothing their draws may read goes without a barrier, side by side with them; the dispatches after it check against
+// the passes too (pass_live), and the next pass begins behind a full barrier (bar_other). With the pass barriers left
+// out (el_on: AMD GCN) only. SAVAGEWIND_VK_DISPATCH_AFTER_PASS=0: a full barrier, as before.
+static bool dispatch_after_pass_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SAVAGEWIND_VK_DISPATCH_AFTER_PASS");
+        on = !e || atoi(e);
     }
     return on;
 }
@@ -9289,6 +9378,29 @@ static bool dov_meet(const DovRange *a, int na, const DovRange *b, int nb) {
     return false;
 }
 
+// The images a dispatch of cp samples: none drawn into by the passes since the last barrier (el_w)
+static bool dispatch_samples_clear(const CsProg *cp) {
+    if (!el_on() || el_w_full) return false;
+    ShaderInfo *si = cp->si;
+    for (int i = 0; i < si->ntex; i++) {
+        ShaderTexture *sx = &si->tex[i];
+        if (sx->is_image || sx->bindless) return false;
+        NvnTexture *t = shader_texture_object(5, sx);
+        // (a shadow sampler on a colour image reads its depth twin, written only by depth_twin_update's copies, each
+        // ordered before all that follows: its source is checked as if sampled; on the shadow copy, the cascades)
+        if (sx->shadow && shadow_copy_source(t)) return false;
+        if (!t) continue;  // (nothing bound)
+        TexBackend *tb = t->backend;
+        if (!tb || !tb->image || tb->block || tb->block_pending || t == scene_up.t) return false;
+        // (a tracked depth target in its read-only layout: after any pass that wrote it came the move into that
+        // layout, whose barrier is before the dispatch - BOTW's particles sample the depth their passes test against)
+        if (dl_tracked(tb) && tb->dl == DL_RO) continue;
+        for (int k = 0; k < el_nw; k++)
+            if (el_w[k].img == tb->image) return false;
+    }
+    return true;
+}
+
 static void wait_built(_Atomic int *state);
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
@@ -9312,11 +9424,16 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     DovRange rd[34], wr[16];
     int nrd = 0, nwr = 0;
     bool known = dispatch_overlap_on() && dispatch_ranges(cp, rd, &nrd, wr, &nwr);
-    if (chain && after_dispatch && known && !dov_unknown && dov_nw + nwr <= DOV_MAX && dov_nr + nrd <= DOV_MAX &&
-        !dov_meet(dov_w, dov_nw, rd, nrd) && !dov_meet(dov_r, dov_nr, wr, nwr)) {
+    // (a dispatch after passes, above) passes since the last full barrier: neither a barrier nor a compute-only one
+    // where it samples nothing they drew into and writes nothing their draws may read
+    bool passes_clear = !pass_live || (dispatch_after_pass_on() && known && !pass_wrote && !pr_unknown &&
+                                       !dov_meet(pr_rd, pr_n, wr, nwr) && dispatch_samples_clear(cp));
+    if (chain && (after_dispatch || after_pass) && known && passes_clear && !dov_unknown && dov_nw + nwr <= DOV_MAX &&
+        dov_nr + nrd <= DOV_MAX && !dov_meet(dov_w, dov_nw, rd, nrd) && !dov_meet(dov_r, dov_nr, wr, nwr)) {
         stat_dispatch_overlap++;
+        stat_dispatch_after_pass += after_pass;
     } else {
-        if (chain && after_dispatch) {
+        if (chain && after_dispatch && passes_clear) {
             VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                                    .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                                    .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT};
@@ -9329,6 +9446,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         dov_nw = dov_nr = 0;
         dov_unknown = false;
     }
+    bar_other = vtx_hazard = true;  // (the next pass: behind a full barrier)
     memcpy(dov_w + dov_nw, wr, (size_t)nwr * sizeof *wr);
     memcpy(dov_r + dov_nr, rd, (size_t)nrd * sizeof *rd);
     dov_nw += nwr;
@@ -9409,6 +9527,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     rec_CmdDispatch(cb, gx, gy, gz);
     stat_dispatches++;
     after_dispatch = true;
+    after_pass = false;
     chunk_draws++;
     if (cp->si->writes_gmem) {
         if (ENV_ONCE("SAVAGEWIND_LOG_HOLD")) {
@@ -9933,6 +10052,7 @@ static void draw_(CmdRec *r, bool indexed) {
     begin_pass();
     if (pass_void) { el_for_draw = false; stat_skipped++; return; }
     if (!dl_check_draw(pr)) { el_for_draw = false; stat_skipped++; return; }
+    pr_note_draw(pr, indexed ? r->x[3] : 0, indexed ? (uint64_t)r->x[2] * 4 : 0);  // (what a dispatch after the pass may not write)
     el_for_draw = false;
     // ---- motion vectors (mvec.c): an opaque draw of a pass with the motion target is recorded (its identity and the
     // vertex shader's inputs, for the next frame); matched with one of the previous frame, it is drawn with its motion
@@ -10587,7 +10707,7 @@ have_pipe:
     draws_total++;
     chunk_draws++;
     if (pr->vi->writes_gmem || pr->fi->writes_gmem) {
-        bar_other = true;
+        bar_other = pass_wrote = true;
         if (pr->vi->writes_gmem) gw_note(0);
         if (pr->fi->writes_gmem) gw_note(1);
         if (ENV_ONCE("SAVAGEWIND_LOG_HOLD")) LOG("[hold] frame %llu draw %llu: vs %llx (%d) fs %llx (%d) fs hash %016llx\n",
